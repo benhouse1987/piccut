@@ -441,8 +441,8 @@ class TestImageViewerLogic(unittest.TestCase):
 
     @patch('image_viewer.Image.open')
     @patch('image_viewer.os') # Mock the entire os module used by image_viewer
-    def test_open_image_populates_image_list_and_index_with_normalization(self, mock_os_module, mock_image_open):
-        """Test directory scanning with path normalization."""
+    def test_open_image_populates_image_list_and_index_and_resets_zoom_state(self, mock_os_module, mock_image_open):
+        """Test directory scanning, path normalization, and double-click zoom state reset."""
         mock_image_open.return_value = self.mock_pil_image
 
         # Setup mock os module functions
@@ -502,6 +502,8 @@ class TestImageViewerLogic(unittest.TestCase):
             self.fail(f"Normalized opened path {expected_opened_path_normalized} not found in normalized list {expected_image_list_normalized}")
 
         self.assertEqual(self.viewer.current_image_index, expected_index)
+        # Test reset of is_zoomed_to_original_size
+        self.assertFalse(self.viewer.is_zoomed_to_original_size)
 
 
     @patch('image_viewer.Image.open')
@@ -692,19 +694,23 @@ class TestImageViewerLogic(unittest.TestCase):
         with patch.object(self.viewer, '_fit_image_to_canvas', return_value=True) as mock_fit, \
              patch.object(self.viewer, 'update_display') as mock_update_display:
             
+            self.viewer.is_zoomed_to_original_size = True # Set before call
             self.viewer._perform_fit_to_window_update()
 
             mock_fit.assert_called_once()
             mock_update_display.assert_called_once()
             self.assertIsNone(self.viewer.resize_debounce_timer)
+            self.assertFalse(self.viewer.is_zoomed_to_original_size) # Verify reset
 
     def test_perform_fit_to_window_update_no_image(self):
         self.viewer.image = None
+        self.viewer.is_zoomed_to_original_size = True # Check it doesn't change if no image
         with patch.object(self.viewer, '_fit_image_to_canvas') as mock_fit, \
              patch.object(self.viewer, 'update_display') as mock_update_display:
             self.viewer._perform_fit_to_window_update()
             mock_fit.assert_not_called() # Should not be called if no image
             mock_update_display.assert_not_called()
+            self.assertTrue(self.viewer.is_zoomed_to_original_size) # State unchanged
 
     # --- Ctrl+O Shortcut Test ---
     @patch('image_viewer.filedialog.askopenfilename') # Patch where it's used

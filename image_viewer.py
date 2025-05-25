@@ -40,6 +40,7 @@ class ImageViewer:
         self.resize_debounce_timer = None # Timer for debouncing window resize fitting
         self.image_list = [] # List of image files in the current directory
         self.current_image_index = -1 # Index of the current image in image_list
+        self.is_zoomed_to_original_size = False # State for double-click zoom
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -61,6 +62,8 @@ class ImageViewer:
         self.canvas.bind("<ButtonPress-1>", self.start_pan)
         self.canvas.bind("<B1-Motion>", self.pan_image)
         self.canvas.bind("<ButtonRelease-1>", self.stop_pan)
+        # Bind double-click for zoom toggle
+        self.canvas.bind('<Double-Button-1>', self.handle_double_click_zoom)
 
         # Create a menu bar.
         menubar = Menu(master)
@@ -158,7 +161,8 @@ class ImageViewer:
             
             # Fit image to window initially using the new helper method
             self.master.update_idletasks() # Ensure canvas dimensions are current before fitting
-            self._fit_image_to_canvas() 
+            if self._fit_image_to_canvas():
+                self.is_zoomed_to_original_size = False
             
             # Scan directory for other images
             current_dir = os.path.dirname(self.image_path)
@@ -221,8 +225,8 @@ class ImageViewer:
         new_height = max(1, int(self.image.height * self.zoom_factor))
 
         try:
-            # Resize the original image using Pillow's BILINEAR filter for improved speed.
-            resized_image = self.image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+            # Resize the original image using Pillow's NEAREST filter for maximum speed.
+            resized_image = self.image.resize((new_width, new_height), Image.Resampling.NEAREST)
             # Convert the Pillow image to a Tkinter PhotoImage.
             # This PhotoImage must be stored as an instance variable to prevent garbage collection.
             self.tk_image = ImageTk.PhotoImage(resized_image)
@@ -254,6 +258,8 @@ class ImageViewer:
         """
         if self.image is None:
             return # No image loaded, cannot zoom.
+        
+        self.is_zoomed_to_original_size = False # Any scroll zoom overrides double-click state
 
         zoom_step = 0.1 # Proportional zoom step.
         
@@ -510,7 +516,40 @@ class ImageViewer:
         self.resize_debounce_timer = None
         if self.image:
             if self._fit_image_to_canvas(): # This updates zoom_factor, image_x, image_y
+                self.is_zoomed_to_original_size = False # Reset on fit-to-window
                 self.update_display()
+
+    def handle_double_click_zoom(self, event):
+        """
+        Toggles zoom between fit-to-window and 100% (original size) centered at cursor.
+        """
+        if not self.image:
+            return
+
+        if not self.is_zoomed_to_original_size:
+            # Zoom to 100% (original size) centered at event.x, event.y
+            previous_zoom_factor = self.zoom_factor 
+            
+            # Calculate which point on the original image is under the cursor
+            image_point_x_on_original = (event.x - self.image_x) / previous_zoom_factor
+            image_point_y_on_original = (event.y - self.image_y) / previous_zoom_factor
+
+            self.zoom_factor = 1.0 # Target zoom is 100%
+
+            # Calculate new self.image_x, self.image_y so that image_point_x/y_on_original
+            # is now at canvas event.x, event.y
+            self.image_x = event.x - (image_point_x_on_original * self.zoom_factor)
+            self.image_y = event.y - (image_point_y_on_original * self.zoom_factor)
+            
+            self.is_zoomed_to_original_size = True
+        else:
+            # Zoom back to fit-to-window
+            if self._fit_image_to_canvas():
+                self.is_zoomed_to_original_size = False
+            # If _fit_image_to_canvas failed (e.g. no canvas dimensions),
+            # is_zoomed_to_original_size remains true, next double click will try again.
+        
+        self.update_display()
 
 
 # --- Main Application Setup ---
