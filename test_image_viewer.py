@@ -19,20 +19,22 @@ class TestImageViewerLogic(unittest.TestCase):
 
     def setUp(self):
         """Set up for each test method."""
-        # Mock the Tkinter root window
-        self.mock_root = MagicMock()
-        self.mock_root.winfo_width.return_value = 800 # Default root window size
-        self.mock_root.winfo_height.return_value = 600
+        # Mock the Tkinter root window - this is self.viewer.master
+        self.mock_master = MagicMock(spec=['after', 'after_cancel', 'title', 'bind', 'config', 'quit', 'update_idletasks', 'geometry'])
+        self.mock_master.after.return_value = "timer_id_123" # Mock timer ID
+        self.mock_master.winfo_width.return_value = 800 
+        self.mock_master.winfo_height.return_value = 600
 
         # Patch the Canvas and other Tkinter UI elements that ImageViewer creates internally
         with patch('image_viewer.Canvas', MagicMock()) as self.mock_canvas_constructor, \
-             patch('image_viewer.Menu', MagicMock()):
-            self.viewer = ImageViewer(self.mock_root)
+             patch('image_viewer.Menu', MagicMock()): # Menu is also created in __init__
+            self.viewer = ImageViewer(self.mock_master) # Pass the fully mocked master
             self.viewer.canvas = self.mock_canvas_constructor.return_value
 
         # Set default canvas dimensions for tests
         self.viewer.canvas.winfo_width.return_value = 600
         self.viewer.canvas.winfo_height.return_value = 400
+        self.viewer.image_on_canvas = "mock_canvas_item_id" # Simulate image item exists
 
         # Mock the original Pillow image object
         self.mock_pil_image = MagicMock(spec=Image.Image) # Use spec for better mocking
@@ -72,6 +74,63 @@ class TestImageViewerLogic(unittest.TestCase):
         self.assertEqual(self.viewer.image.width, 1000)
         self.assertEqual(self.viewer.image.height, 750)
         self.assertEqual(self.viewer.image_path, "/fake/path/to/original_image.png")
+        self.assertIsNotNone(self.viewer.image_on_canvas) # Check if image_on_canvas is set
+
+    # --- Pan Logic Tests ---
+    def test_pan_image_updates_coords_and_calls_canvas_coords(self):
+        """Test that pan_image updates image_x, image_y and calls canvas.coords."""
+        self.viewer.image = self.mock_pil_image # Ensure image is loaded
+        self.viewer.image_on_canvas = "test_image_id" # Ensure image_on_canvas is set
+
+        # Initial position
+        self.viewer.image_x = 10
+        self.viewer.image_y = 20
+        self.viewer.drag_start_x = 50
+        self.viewer.drag_start_y = 50
+        self.viewer.dragging = True
+
+        mock_event = self.create_mock_event(x=60, y=75) # Pan by dx=10, dy=25
+
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.pan_image(mock_event)
+
+            # Check new coordinates
+            self.assertEqual(self.viewer.image_x, 10 + 10) # 20
+            self.assertEqual(self.viewer.image_y, 20 + 25) # 45
+            # Check drag_start is updated
+            self.assertEqual(self.viewer.drag_start_x, 60)
+            self.assertEqual(self.viewer.drag_start_y, 75)
+
+            # Check canvas.coords was called
+            self.viewer.canvas.coords.assert_called_once_with("test_image_id", 20, 45)
+            # Check update_display was NOT called
+            mock_update_display.assert_not_called()
+
+    def test_pan_image_does_nothing_if_not_dragging(self):
+        self.viewer.dragging = False # Ensure not dragging
+        initial_x = self.viewer.image_x
+        initial_y = self.viewer.image_y
+        mock_event = self.create_mock_event(x=60, y=75)
+
+        with patch.object(self.viewer.canvas, 'coords') as mock_canvas_coords, \
+             patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.pan_image(mock_event)
+            self.assertEqual(self.viewer.image_x, initial_x)
+            self.assertEqual(self.viewer.image_y, initial_y)
+            mock_canvas_coords.assert_not_called()
+            mock_update_display.assert_not_called()
+
+    def test_pan_image_fallback_to_update_display_if_no_canvas_item(self):
+        self.viewer.image_on_canvas = None # Simulate no canvas item ID
+        self.viewer.dragging = True
+        self.viewer.drag_start_x = 0
+        self.viewer.drag_start_y = 0
+        mock_event = self.create_mock_event(x=10, y=10)
+
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.pan_image(mock_event)
+            mock_update_display.assert_called_once() # Fallback was called
+
 
     # --- Zoom Logic Tests ---
     def create_mock_event(self, x, y, delta=0, num=0):
@@ -84,85 +143,121 @@ class TestImageViewerLogic(unittest.TestCase):
         return event
 
     def test_zoom_in(self):
-        """Test basic zoom-in functionality."""
+        """Test basic zoom-in functionality (parameter calculation)."""
         initial_zoom = self.viewer.zoom_factor
-        mock_event = self.create_mock_event(x=100, y=100, delta=120) # Windows scroll up
-        self.viewer.zoom_image(mock_event)
-        self.assertGreater(self.viewer.zoom_factor, initial_zoom)
+        mock_event = self.create_mock_event(x=100, y=100, delta=120)
+        
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.zoom_image(mock_event)
+            self.assertGreater(self.viewer.zoom_factor, initial_zoom)
+            mock_update_display.assert_not_called() # Should not be called directly
+            self.viewer.master.after.assert_called_once() # Check if scheduled
 
     def test_zoom_out(self):
-        """Test basic zoom-out functionality."""
+        """Test basic zoom-out functionality (parameter calculation)."""
         initial_zoom = self.viewer.zoom_factor
-        mock_event = self.create_mock_event(x=100, y=100, delta=-120) # Windows scroll down
-        self.viewer.zoom_image(mock_event)
-        self.assertLess(self.viewer.zoom_factor, initial_zoom)
+        mock_event = self.create_mock_event(x=100, y=100, delta=-120)
+        
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.zoom_image(mock_event)
+            self.assertLess(self.viewer.zoom_factor, initial_zoom)
+            mock_update_display.assert_not_called()
+            self.viewer.master.after.assert_called_once()
 
     def test_zoom_limits(self):
-        """Test that zoom factor is clamped to min/max limits."""
-        # Zoom in excessively
-        for _ in range(50):
-            self.viewer.zoom_image(self.create_mock_event(100, 100, delta=120))
-        self.assertAlmostEqual(self.viewer.zoom_factor, 5.0, places=5)
+        """Test that zoom factor is clamped (parameter calculation)."""
+        with patch.object(self.viewer, 'update_display'), \
+             patch.object(self.viewer.master, 'after') as mock_master_after: # Ensure after is checkable
+            # Zoom in excessively
+            for _ in range(50):
+                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=120))
+            self.assertAlmostEqual(self.viewer.zoom_factor, 5.0, places=5)
+            # Check that master.after was called for each zoom_image call
+            self.assertEqual(mock_master_after.call_count, 50) 
 
-        # Reset zoom for next part of test (not strictly necessary if always starting from 1.0 in setup)
-        self.viewer.zoom_factor = 1.0 
-        self.viewer.image_x = 0 # Reset position as zoom changes it
-        self.viewer.image_y = 0
 
-        # Zoom out excessively
-        for _ in range(50):
-            self.viewer.zoom_image(self.create_mock_event(100, 100, delta=-120))
-        self.assertAlmostEqual(self.viewer.zoom_factor, 0.1, places=5)
+            # Reset zoom and image position for the next part of test
+            self.viewer.zoom_factor = 1.0 
+            self.viewer.image_x = 0 
+            self.viewer.image_y = 0
+            # Reset mock_master_after call count for the next batch of calls
+            mock_master_after.reset_mock()
+
+            # Zoom out excessively
+            for _ in range(50):
+                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=-120))
+            self.assertAlmostEqual(self.viewer.zoom_factor, 0.1, places=5)
+            self.assertEqual(mock_master_after.call_count, 50)
         
     def test_zoom_towards_cursor_calculation(self):
-        """
-        Test the core logic of zooming towards the cursor.
-        If we zoom in on a point, that point on the original image
-        should remain under the cursor.
-        """
-        self.viewer.image = self.mock_pil_image # Original image 1000x750
+        """Test the core logic of zooming towards the cursor (parameter calculation)."""
         self.viewer.zoom_factor = 1.0
-        # Initial state: image top-left is at canvas (0,0)
         self.viewer.image_x = 0 
         self.viewer.image_y = 0
         
-        # Cursor position on canvas
         mouse_x_on_canvas = 100
         mouse_y_on_canvas = 75
-
-        # The point on the original image under the cursor is (100, 75)
-        # because zoom is 1.0 and image_x/y is 0.
+        mock_event = self.create_mock_event(mouse_x_on_canvas, mouse_y_on_canvas, delta=120)
         
-        mock_event = self.create_mock_event(mouse_x_on_canvas, mouse_y_on_canvas, delta=120) # Zoom in
-        
-        # Store previous zoom_factor, as it's used in the calculation within zoom_image
-        # The actual method `zoom_image` uses self.zoom_factor before it's updated.
-        # So the `previous_zoom_factor` for the first zoom step is self.zoom_factor.
-        # Our mock setup needs to reflect that `img_coord_x_on_original` uses the `previous_zoom_factor`.
-        # The `zoom_image` method calculates `previous_zoom_factor` internally.
-        # The calculation in the method is:
-        # img_coord_x_on_original = (mouse_x - self.image_x) / previous_zoom_factor (where previous_zoom_factor is self.zoom_factor before update)
-        # self.image_x = mouse_x - (img_coord_x_on_original * self.zoom_factor) (where self.zoom_factor is the new one)
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.zoom_image(mock_event)
 
-        self.viewer.zoom_image(mock_event) # This updates self.zoom_factor and self.image_x/y
+            new_zoom_factor = self.viewer.zoom_factor 
+            expected_image_x = mouse_x_on_canvas - (100 * new_zoom_factor)
+            expected_image_y = mouse_y_on_canvas - (75 * new_zoom_factor)
+            
+            self.assertAlmostEqual(self.viewer.image_x, expected_image_x, places=5)
+            self.assertAlmostEqual(self.viewer.image_y, expected_image_y, places=5)
+            self.assertAlmostEqual((mouse_x_on_canvas - self.viewer.image_x) / self.viewer.zoom_factor, 100, places=3)
+            self.assertAlmostEqual((mouse_y_on_canvas - self.viewer.image_y) / self.viewer.zoom_factor, 75, places=3)
+            
+            mock_update_display.assert_not_called()
+            self.viewer.master.after.assert_called_once()
 
-        new_zoom_factor = self.viewer.zoom_factor # Should be 1.0 * 1.1 = 1.1
-        
-        # Verify the new image_x and image_y
-        # Expected original image point under cursor: (100, 75)
-        # new_image_x = mouse_x_on_canvas - (100 * new_zoom_factor)
-        # new_image_y = mouse_y_on_canvas - (75 * new_zoom_factor)
-        expected_image_x = mouse_x_on_canvas - (100 * new_zoom_factor)
-        expected_image_y = mouse_y_on_canvas - (75 * new_zoom_factor)
-        
-        self.assertAlmostEqual(self.viewer.image_x, expected_image_x, places=5)
-        self.assertAlmostEqual(self.viewer.image_y, expected_image_y, places=5)
+    def test_zoom_image_schedules_update_and_calculates_params(self):
+        self.viewer.image = self.mock_pil_image 
+        self.viewer.image_path = "/fake/path.png" 
+        initial_zoom = self.viewer.zoom_factor = 1.0 # Set specific initial state
+        initial_x = self.viewer.image_x = 0
+        initial_y = self.viewer.image_y = 0
 
-        # After zoom, the point (100,75) on the original image should still be under the cursor (100,75) on canvas.
-        # Check: (mouse_x_on_canvas - new_image_x) / new_zoom_factor should be 100
-        # Check: (mouse_y_on_canvas - new_image_y) / new_zoom_factor should be 75
-        self.assertAlmostEqual((mouse_x_on_canvas - self.viewer.image_x) / self.viewer.zoom_factor, 100, places=3)
-        self.assertAlmostEqual((mouse_y_on_canvas - self.viewer.image_y) / self.viewer.zoom_factor, 75, places=3)
+        mock_event = self.create_mock_event(x=100, y=100, delta=120) 
+        
+        # self.viewer.master is already mocked in setUp
+        self.viewer.master.after.return_value = "timer1" # Ensure specific timer ID
+        
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer.zoom_image(mock_event)
+
+            self.assertNotEqual(self.viewer.zoom_factor, initial_zoom)
+            self.assertNotEqual(self.viewer.image_x, initial_x)
+            self.assertNotEqual(self.viewer.image_y, initial_y)
+            mock_update_display.assert_not_called()
+            self.viewer.master.after.assert_called_once_with(100, self.viewer._perform_zoom_update)
+            self.assertEqual(self.viewer.zoom_debounce_timer, "timer1")
+
+    def test_zoom_image_cancels_pending_timer(self):
+        self.viewer.image = self.mock_pil_image
+        self.viewer.zoom_debounce_timer = "old_timer_id" # Simulate a pending timer
+        
+        mock_event = self.create_mock_event(x=100, y=100, delta=120)
+        
+        self.viewer.master.after.return_value = "new_timer_id"
+
+        self.viewer.zoom_image(mock_event)
+        
+        self.viewer.master.after_cancel.assert_called_once_with("old_timer_id")
+        self.viewer.master.after.assert_called_once_with(100, self.viewer._perform_zoom_update)
+        self.assertEqual(self.viewer.zoom_debounce_timer, "new_timer_id")
+
+    def test_perform_zoom_update_calls_update_display(self):
+        self.viewer.image = self.mock_pil_image 
+        self.viewer.zoom_debounce_timer = "some_timer_id" 
+        
+        with patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer._perform_zoom_update()
+            mock_update_display.assert_called_once()
+            self.assertIsNone(self.viewer.zoom_debounce_timer)
 
 
     # --- Crop Coordinate Calculation Tests (`save_cropped_image`) ---

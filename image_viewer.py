@@ -36,6 +36,7 @@ class ImageViewer:
         self.image_y = 0  # Top-left y-coordinate of the image on the canvas.
         self.image_on_canvas = None # ID of the image item on the canvas.
         self.image_path = None # Path to the currently loaded image.
+        self.zoom_debounce_timer = None # Timer for debouncing zoom operations
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -164,8 +165,8 @@ class ImageViewer:
         new_height = max(1, int(self.image.height * self.zoom_factor))
 
         try:
-            # Resize the original image using Pillow's LANCZOS filter for quality.
-            resized_image = self.image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            # Resize the original image using Pillow's BICUBIC filter for a balance of quality and speed.
+            resized_image = self.image.resize((new_width, new_height), Image.Resampling.BICUBIC)
             # Convert the Pillow image to a Tkinter PhotoImage.
             # This PhotoImage must be stored as an instance variable to prevent garbage collection.
             self.tk_image = ImageTk.PhotoImage(resized_image)
@@ -237,7 +238,22 @@ class ImageViewer:
         self.image_x = mouse_x - (img_coord_x_on_original * self.zoom_factor)
         self.image_y = mouse_y - (img_coord_y_on_original * self.zoom_factor)
         
-        self.update_display() # Redraw the image with the new zoom and position.
+        # Schedule the actual image update
+        self.zoom_debounce_timer = self.master.after(100, self._perform_zoom_update) # 100ms delay
+
+    def _perform_zoom_update(self):
+        """
+        Performs the actual image update after a debounce delay.
+        This method is called by the timer set in `zoom_image`.
+        """
+        if self.image is None: # Check if image is still loaded
+            return
+
+        # Reset timer ID since it has now fired
+        self.zoom_debounce_timer = None
+
+        # Now call update_display with the latest self.zoom_factor, self.image_x, self.image_y
+        self.update_display()
 
     def start_pan(self, event):
         """
@@ -277,7 +293,12 @@ class ImageViewer:
             self.drag_start_x = event.x
             self.drag_start_y = event.y
             
-            self.update_display() # Redraw the image at the new position.
+            # Directly move the existing image item on the canvas for performance.
+            if self.image_on_canvas:
+                self.canvas.coords(self.image_on_canvas, self.image_x, self.image_y)
+            else:
+                # Fallback or if image_on_canvas was somehow lost, though unlikely with current logic
+                self.update_display() 
 
     def stop_pan(self, event):
         """
