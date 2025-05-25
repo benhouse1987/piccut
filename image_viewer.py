@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, Menu, Canvas, messagebox
+import os
+from datetime import datetime
 try:
     from PIL import ImageTk, Image
     PIL_AVAILABLE = True
@@ -33,6 +35,7 @@ class ImageViewer:
         self.image_x = 0  # Top-left x-coordinate of the image on the canvas.
         self.image_y = 0  # Top-left y-coordinate of the image on the canvas.
         self.image_on_canvas = None # ID of the image item on the canvas.
+        self.image_path = None # Path to the currently loaded image.
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -94,46 +97,52 @@ class ImageViewer:
 
         try:
             # Attempt to open the image using Pillow.
-            self.image = Image.open(filepath)
+            new_image = Image.open(filepath)
+            self.image = new_image
+            self.image_path = filepath # Store image path on successful load
             
-            # Reset zoom factor and image position for the new image.
-            self.zoom_factor = 1.0
-            
-            # Center the image on the canvas.
-            # Get current canvas dimensions. Canvas might not have its final size yet if window just opened.
-            self.master.update_idletasks() # Process pending geometry changes to get correct canvas size.
+            # --- Fit image to window initially ---
+            self.master.update_idletasks() # Ensure canvas dimensions are current.
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
+            img_width, img_height = self.image.size
 
-            img_width, img_height = self.image.size # Original image dimensions
-            
-            # Calculate top-left (image_x, image_y) to center the image at zoom_factor 1.0.
-            # If image is smaller than canvas, center it.
-            # If image is larger, position its top-left at canvas (0,0) or based on preferred policy.
-            # Current policy: Center if smaller, else align top-left of image with canvas top-left.
-            
-            scaled_img_width = img_width * self.zoom_factor # at this point, zoom_factor is 1.0
-            scaled_img_height = img_height * self.zoom_factor
-
-            if scaled_img_width < canvas_width:
-                self.image_x = (canvas_width - scaled_img_width) / 2
+            if img_width <= 0 or img_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
+                # If any dimension is zero/negative, default to zoom 1.0 and simple centering.
+                self.zoom_factor = 1.0
+                new_scaled_width = img_width
+                new_scaled_height = img_height
             else:
-                self.image_x = 0 # Image is wider than canvas, align left
+                width_ratio = canvas_width / img_width
+                height_ratio = canvas_height / img_height
+                self.zoom_factor = min(width_ratio, height_ratio)
 
-            if scaled_img_height < canvas_height:
-                self.image_y = (canvas_height - scaled_img_height) / 2
-            else:
-                self.image_y = 0 # Image is taller than canvas, align top
+                # If zoom_factor makes image extremely small or negative (shouldn't happen with min of positive ratios)
+                # or if image is already smaller than canvas (ratios > 1), let it scale up to fit.
+                # If min_ratio makes image too small (e.g. very thin canvas), limit zoom_out.
+                # For now, the min(width_ratio, height_ratio) logic is kept.
+                # Ensure zoom_factor is not zero or negative.
+                if self.zoom_factor <= 0:
+                    self.zoom_factor = 1.0 # Fallback
+
+                new_scaled_width = int(img_width * self.zoom_factor)
+                new_scaled_height = int(img_height * self.zoom_factor)
+            
+            # Center the initially fitted image.
+            self.image_x = (canvas_width - new_scaled_width) / 2
+            self.image_y = (canvas_height - new_scaled_height) / 2
             
             self.update_display()
 
         except FileNotFoundError:
             messagebox.showerror("Error", f"File not found: {filepath}")
-            self.image = None # Ensure image is None if opening failed
+            self.image = None 
+            self.image_path = None # Reset path on failure
         except Exception as e:
             # Catch other potential Pillow errors (e.g., unrecognized format, truncated file)
             messagebox.showerror("Error Opening Image", f"Could not open or read image file:\n{filepath}\n\nDetails: {e}")
-            self.image = None # Ensure image is None if opening failed
+            self.image = None
+            self.image_path = None # Reset path on failure
 
     def update_display(self):
         """
@@ -301,71 +310,61 @@ class ImageViewer:
             messagebox.showerror("Error", "Pillow library is not available. Cannot save images.")
             return
 
+        if not self.image_path: # Check if original image path is known
+            messagebox.showerror("Error", "Original image path is not known. Cannot save automatically.")
+            return
+
         # Get current dimensions of the canvas.
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
 
-        # --- Calculate Crop Coordinates ---
-        # 1. Determine the visible rectangle on the *scaled* image, in the scaled image's coordinate system.
-        #    The canvas top-left is (0,0). The scaled image's top-left on canvas is (self.image_x, self.image_y).
-        #    So, the point (0,0) on canvas corresponds to (-self.image_x, -self.image_y) on the scaled image.
+        # --- Calculate Crop Coordinates (existing logic) ---
         scaled_img_visible_x1 = -self.image_x
         scaled_img_visible_y1 = -self.image_y
         scaled_img_visible_x2 = -self.image_x + canvas_width
         scaled_img_visible_y2 = -self.image_y + canvas_height
         
-        # 2. Convert these coordinates from the scaled image space to the *original* image space.
-        #    This is done by dividing by the current zoom factor.
         original_img_crop_x1 = scaled_img_visible_x1 / self.zoom_factor
         original_img_crop_y1 = scaled_img_visible_y1 / self.zoom_factor
         original_img_crop_x2 = scaled_img_visible_x2 / self.zoom_factor
         original_img_crop_y2 = scaled_img_visible_y2 / self.zoom_factor
 
-        # 3. Clamp these coordinates to the boundaries of the original image.
-        #    This ensures that the crop box does not extend beyond the actual image dimensions.
         img_width, img_height = self.image.size
         final_crop_x1 = max(0, original_img_crop_x1)
         final_crop_y1 = max(0, original_img_crop_y1)
         final_crop_x2 = min(img_width, original_img_crop_x2)
         final_crop_y2 = min(img_height, original_img_crop_y2)
 
-        # 4. Validate the final crop box.
-        #    If the calculated width or height is zero or negative, it means no valid part
-        #    of the image is visible (e.g., image panned completely off-screen).
         if final_crop_x1 >= final_crop_x2 or final_crop_y1 >= final_crop_y2:
             messagebox.showerror("Error", "No part of the image is visible to save, or the visible area is invalid.")
             return
 
-        # 5. Ensure coordinates are integers for Pillow's crop method, as it expects a tuple of ints.
         crop_box = (
-            int(round(final_crop_x1)), # Rounding can be better than truncating with int() for sub-pixel precision issues
+            int(round(final_crop_x1)),
             int(round(final_crop_y1)),
             int(round(final_crop_x2)),
             int(round(final_crop_y2))
         )
 
-        # --- Prompt for Save Location and Save ---
-        filepath = filedialog.asksaveasfilename(
-            title="Save Cropped Image As...",
-            defaultextension=".png",
-            filetypes=[
-                ("PNG files", "*.png"),
-                ("JPEG files", "*.jpg;*.jpeg"),
-                ("BMP files", "*.bmp"),
-                ("GIF files", "*.gif"),
-                ("All files", "*.*")
-            ]
-        )
+        # --- Construct New File Path ---
+        directory = os.path.dirname(self.image_path)
+        basename_full = os.path.basename(self.image_path)
+        basename, extension = os.path.splitext(basename_full)
+        
+        if not extension: # Handle filenames without a dot or empty extension
+            extension = ".png" # Default to .png if no extension
+        
+        timestamp = datetime.now().strftime("_%Y%m%d%H%M%S")
+        new_filename = f"{basename}{timestamp}{extension}"
+        new_filepath = os.path.join(directory, new_filename)
 
-        if not filepath:
-            return
-
+        # --- Save the Image ---
         try:
             cropped_image = self.image.crop(crop_box)
-            cropped_image.save(filepath)
-            messagebox.showinfo("Success", f"Cropped image saved successfully to:\n{filepath}")
+            cropped_image.save(new_filepath)
+            messagebox.showinfo("Success", f"Cropped image saved as\n{new_filepath}")
         except Exception as e:
-            messagebox.showerror("Error Saving Image", f"An error occurred while saving the image: {e}")
+            messagebox.showerror("Save Error", f"Could not save image: {e}")
 
 
 # --- Main Application Setup ---
