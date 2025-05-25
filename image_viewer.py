@@ -37,6 +37,8 @@ class ImageViewer:
         self.image_on_canvas = None # ID of the image item on the canvas.
         self.image_path = None # Path to the currently loaded image.
         self.zoom_debounce_timer = None # Timer for debouncing zoom operations
+        self.image_list = [] # List of image files in the current directory
+        self.current_image_index = -1 # Index of the current image in image_list
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -71,30 +73,37 @@ class ImageViewer:
         # Bind Ctrl+S for saving the cropped/visible part of the image.
         master.bind('<Control-s>', self.save_cropped_image)
 
-    def open_image(self):
+        # Bind Left/Right arrow keys for image navigation (handler to be implemented)
+        master.bind('<Left>', self.handle_arrow_key_event)
+        master.bind('<Right>', self.handle_arrow_key_event)
+
+    def open_image(self, filepath=None): # Modified to accept optional filepath
         """
         Open an image file, display it on the canvas, and reset view.
 
-        Shows a file dialog for the user to select an image.
-        If an image is selected, it's loaded, centered, and displayed.
-        Zoom and pan are reset to default.
+        If `filepath` is None, shows a file dialog for the user to select an image.
+        Otherwise, attempts to load the image from the given `filepath`.
+        If an image is selected/provided and loaded, it's fitted to window,
+        and the current directory is scanned for other images.
         """
         if not PIL_AVAILABLE:
             messagebox.showerror("Error", "Pillow library is not installed. Image opening functionality is disabled.")
             return
 
-        filepath = filedialog.askopenfilename(
-            title="Open Image",
-            filetypes=[
-                ('Image Files', ('*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp')),
-                ('PNG files', '*.png'),
-                ('JPEG files', ('*.jpg', '*.jpeg')),
-                ('GIF files', '*.gif'),
-                ('BMP files', '*.bmp'),
-                ('All files', '*.*')
-            ]
-        )
-        if not filepath:
+        if filepath is None: # Only show dialog if no path is provided
+            filepath = filedialog.askopenfilename(
+                title="Open Image",
+                filetypes=[
+                    ('Image Files', ('*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp')),
+                    ('PNG files', '*.png'),
+                    ('JPEG files', ('*.jpg', '*.jpeg')),
+                    ('GIF files', '*.gif'),
+                    ('BMP files', '*.bmp'),
+                    ('All files', '*.*')
+                ]
+            )
+        
+        if not filepath: # If no filepath from dialog or was initially None
             return
 
         try:
@@ -134,17 +143,45 @@ class ImageViewer:
             self.image_x = (canvas_width - new_scaled_width) / 2
             self.image_y = (canvas_height - new_scaled_height) / 2
             
+            # Scan directory for other images
+            current_dir = os.path.dirname(self.image_path)
+            valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
+            try:
+                all_files_in_dir = os.listdir(current_dir)
+                self.image_list = sorted([
+                    os.path.join(current_dir, f)
+                    for f in all_files_in_dir
+                    if os.path.isfile(os.path.join(current_dir, f)) and \
+                       f.lower().endswith(valid_extensions)
+                ])
+            except OSError: # Handle potential permission errors etc.
+                self.image_list = []
+            
+            if self.image_list:
+                try:
+                    self.current_image_index = self.image_list.index(self.image_path)
+                except ValueError:
+                    # Should not happen if image_path was found by listdir, but as a fallback
+                    self.image_list = [] # Invalidate list if current path not in it
+                    self.current_image_index = -1
+            else:
+                self.current_image_index = -1
+
             self.update_display()
 
         except FileNotFoundError:
             messagebox.showerror("Error", f"File not found: {filepath}")
             self.image = None 
             self.image_path = None # Reset path on failure
+            self.image_list = []
+            self.current_image_index = -1
         except Exception as e:
             # Catch other potential Pillow errors (e.g., unrecognized format, truncated file)
             messagebox.showerror("Error Opening Image", f"Could not open or read image file:\n{filepath}\n\nDetails: {e}")
             self.image = None
             self.image_path = None # Reset path on failure
+            self.image_list = []
+            self.current_image_index = -1
 
     def update_display(self):
         """
@@ -387,6 +424,50 @@ class ImageViewer:
             messagebox.showinfo("Success", f"Cropped image saved as\n{new_filepath}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Could not save image: {e}")
+
+    def handle_arrow_key_event(self, event):
+        """
+        Handles Left and Right arrow key presses for image navigation.
+        """
+        if not self.image_list: # No list of images to navigate
+            return
+
+        direction = 0
+        if event.keysym == 'Left':
+            direction = -1
+        elif event.keysym == 'Right':
+            direction = 1 # Corrected to +1
+        else: # Should not happen if bindings are specific
+            return
+
+        if direction != 0:
+            self._load_adjacent_image(direction)
+
+    def _load_adjacent_image(self, direction):
+        """
+        Loads the next or previous image in the `self.image_list`.
+
+        Args:
+            direction (int): -1 for previous, +1 for next.
+        """
+        if not self.image_list or self.current_image_index == -1:
+            # No image list or current image not properly identified in the list
+            return
+
+        new_index = self.current_image_index + direction
+
+        if 0 <= new_index < len(self.image_list):
+            # Check if the new image is different from the current one
+            if new_index != self.current_image_index: # This also implicitly checks if new_index is same as current
+                new_image_path = self.image_list[new_index]
+                # self.open_image will handle loading, display, and also
+                # re-scanning the directory and updating self.image_list and self.current_image_index.
+                self.open_image(filepath=new_image_path)
+        # else:
+            # Optional: Provide feedback if at the start/end of the list
+            # For example, using tkinter.messagebox.showinfo or a status bar
+            # print(f"At {'start' if direction == -1 else 'end'} of image list.")
+            # By default, do nothing if out of bounds (no wrapping around)
 
 
 # --- Main Application Setup ---

@@ -437,6 +437,166 @@ class TestImageViewerLogic(unittest.TestCase):
                                          fixed_timestamp_str="20230101103000")
         # Expected filename in common_crop_save_test_logic will be image_empty_ext._20230101103000.png
 
+    # --- Keyboard Navigation Tests ---
+
+    @patch('image_viewer.Image.open') # To prevent actual image loading
+    @patch('image_viewer.os')
+    def test_open_image_populates_image_list_and_index(self, mock_os, mock_image_open):
+        """Test that open_image correctly scans directory and sets image_list/index."""
+        mock_image_open.return_value = self.mock_pil_image # Simulate successful image open
+
+        # Configure os mocks
+        fake_dir = '/fake/directory'
+        current_file = 'img2.JPG'
+        current_filepath = os.path.join(fake_dir, current_file)
+
+        mock_os.path.dirname.return_value = fake_dir
+        mock_os.listdir.return_value = ['img1.png', 'img2.JPG', 'text.txt', 'img3.bmp', 'IMG0.gif', 'subdir']
+        
+        # Define side effect for os.path.isfile
+        def isfile_side_effect(path):
+            # Only files in our listdir mock are files, subdir is not.
+            return os.path.basename(path) != 'subdir'
+        mock_os.path.isfile.side_effect = isfile_side_effect
+        mock_os.path.join.side_effect = os.path.join # Use real join
+
+        # Call open_image with a specific filepath to trigger directory scanning
+        self.viewer.open_image(filepath=current_filepath)
+
+        expected_image_list = [
+            os.path.join(fake_dir, 'IMG0.gif'), # Sorted order
+            os.path.join(fake_dir, 'img1.png'),
+            os.path.join(fake_dir, 'img2.JPG'),
+            os.path.join(fake_dir, 'img3.bmp'),
+        ]
+        self.assertEqual(self.viewer.image_list, expected_image_list)
+        self.assertEqual(self.viewer.current_image_index, 2) # Index of img2.JPG
+
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os')
+    def test_open_image_handles_empty_directory(self, mock_os, mock_image_open):
+        mock_image_open.return_value = self.mock_pil_image
+        fake_dir = '/fake/empty_dir'
+        current_filepath = os.path.join(fake_dir, 'img1.png')
+        mock_os.path.dirname.return_value = fake_dir
+        mock_os.listdir.return_value = []
+        mock_os.path.isfile.return_value = True 
+        mock_os.path.join.side_effect = os.path.join
+
+        self.viewer.open_image(filepath=current_filepath)
+        self.assertEqual(self.viewer.image_list, [])
+        self.assertEqual(self.viewer.current_image_index, -1)
+
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os')
+    def test_open_image_handles_directory_with_no_images(self, mock_os, mock_image_open):
+        mock_image_open.return_value = self.mock_pil_image
+        fake_dir = '/fake/no_images_dir'
+        current_filepath = os.path.join(fake_dir, 'anything.txt') # Not an image, but open_image will still scan
+        self.viewer.image_path = current_filepath # Simulate it was set
+        
+        mock_os.path.dirname.return_value = fake_dir
+        mock_os.listdir.return_value = ['file.txt', 'document.doc']
+        mock_os.path.isfile.return_value = True
+        mock_os.path.join.side_effect = os.path.join
+
+        # Need to ensure Image.open doesn't fail for 'anything.txt' if we pass it to open_image
+        # The current open_image logic always tries to Image.open(filepath) first.
+        # For this specific test, we are testing the list population part.
+        # We can assume 'anything.txt' was somehow "opened" (mocked) and now we test list population.
+        # So, directly manipulate image_list and current_image_index setting parts
+        # or ensure filepath passed to open_image is a mock-openable image.
+
+        # Let's make the 'current_filepath' a valid image for the mock_image_open
+        mock_image_open.return_value = self.mock_pil_image 
+        current_image_for_open = os.path.join(fake_dir, 'dummy_opened.png')
+        self.viewer.image_path = current_image_for_open # Set this for the listdir part
+
+        self.viewer.open_image(filepath=current_image_for_open)
+        
+        self.assertEqual(self.viewer.image_list, [])
+        self.assertEqual(self.viewer.current_image_index, -1)
+
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os')
+    def test_open_image_handles_os_error_during_listdir(self, mock_os, mock_image_open):
+        mock_image_open.return_value = self.mock_pil_image
+        fake_dir = '/fake/error_dir'
+        current_filepath = os.path.join(fake_dir, 'img1.png')
+        mock_os.path.dirname.return_value = fake_dir
+        mock_os.listdir.side_effect = OSError("Permission denied")
+        mock_os.path.join.side_effect = os.path.join
+
+        self.viewer.open_image(filepath=current_filepath)
+        self.assertEqual(self.viewer.image_list, [])
+        self.assertEqual(self.viewer.current_image_index, -1)
+
+    def test_handle_arrow_key_event_calls_load_adjacent(self):
+        self.viewer.image_list = ["/img1.png", "/img2.png"] # Ensure image_list is not empty
+        with patch.object(self.viewer, '_load_adjacent_image') as mock_load_adj:
+            # Test Left key
+            mock_event_left = Mock(keysym='Left')
+            self.viewer.handle_arrow_key_event(mock_event_left)
+            mock_load_adj.assert_called_once_with(-1)
+            
+            mock_load_adj.reset_mock() # Reset for next call
+            
+            # Test Right key
+            mock_event_right = Mock(keysym='Right')
+            self.viewer.handle_arrow_key_event(mock_event_right)
+            mock_load_adj.assert_called_once_with(1)
+
+    def test_handle_arrow_key_event_no_list(self):
+        self.viewer.image_list = [] # Empty list
+        with patch.object(self.viewer, '_load_adjacent_image') as mock_load_adj:
+            mock_event_left = Mock(keysym='Left')
+            self.viewer.handle_arrow_key_event(mock_event_left)
+            mock_load_adj.assert_not_called()
+
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_next(self, mock_open_image_method):
+        self.viewer.image_list = ['/path/img1.png', '/path/img2.png', '/path/img3.png']
+        self.viewer.current_image_index = 0
+        self.viewer._load_adjacent_image(1)
+        mock_open_image_method.assert_called_once_with(filepath='/path/img2.png')
+
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_previous(self, mock_open_image_method):
+        self.viewer.image_list = ['/path/img1.png', '/path/img2.png', '/path/img3.png']
+        self.viewer.current_image_index = 1
+        self.viewer._load_adjacent_image(-1)
+        mock_open_image_method.assert_called_once_with(filepath='/path/img1.png')
+
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_next_at_end(self, mock_open_image_method):
+        self.viewer.image_list = ['/path/img1.png', '/path/img2.png', '/path/img3.png']
+        self.viewer.current_image_index = 2 # Last image
+        self.viewer._load_adjacent_image(1)
+        mock_open_image_method.assert_not_called()
+
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_previous_at_start(self, mock_open_image_method):
+        self.viewer.image_list = ['/path/img1.png', '/path/img2.png', '/path/img3.png']
+        self.viewer.current_image_index = 0 # First image
+        self.viewer._load_adjacent_image(-1)
+        mock_open_image_method.assert_not_called()
+
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_empty_list(self, mock_open_image_method):
+        self.viewer.image_list = []
+        self.viewer.current_image_index = -1
+        self.viewer._load_adjacent_image(1)
+        mock_open_image_method.assert_not_called()
+        self.viewer._load_adjacent_image(-1)
+        mock_open_image_method.assert_not_called()
+        
+    @patch.object(ImageViewer, 'open_image')
+    def test_load_adjacent_image_invalid_index(self, mock_open_image_method):
+        self.viewer.image_list = ['/path/img1.png', '/path/img2.png']
+        self.viewer.current_image_index = -1 # Invalid index
+        self.viewer._load_adjacent_image(1)
+        mock_open_image_method.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
