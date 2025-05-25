@@ -85,13 +85,14 @@ class ImageViewer:
 
         filepath = filedialog.askopenfilename(
             title="Open Image",
-            filetypes=(
-                ("PNG files", "*.png"),
-                ("JPG files", "*.jpg;*.jpeg"),
-                ("GIF files", "*.gif"),
-                ("BMP files", "*.bmp"),
-                ("All files", "*.*")
-            )
+            filetypes=[
+                ('Image Files', ('*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp')),
+                ('PNG files', '*.png'),
+                ('JPEG files', ('*.jpg', '*.jpeg')),
+                ('GIF files', '*.gif'),
+                ('BMP files', '*.bmp'),
+                ('All files', '*.*')
+            ]
         )
         if not filepath:
             return
@@ -165,8 +166,8 @@ class ImageViewer:
         new_height = max(1, int(self.image.height * self.zoom_factor))
 
         try:
-            # Resize the original image using Pillow's BICUBIC filter for a balance of quality and speed.
-            resized_image = self.image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+            # Resize the original image using Pillow's BILINEAR filter for improved speed.
+            resized_image = self.image.resize((new_width, new_height), Image.Resampling.BILINEAR)
             # Convert the Pillow image to a Tkinter PhotoImage.
             # This PhotoImage must be stored as an instance variable to prevent garbage collection.
             self.tk_image = ImageTk.PhotoImage(resized_image)
