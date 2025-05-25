@@ -437,40 +437,72 @@ class TestImageViewerLogic(unittest.TestCase):
                                          fixed_timestamp_str="20230101103000")
         # Expected filename in common_crop_save_test_logic will be image_empty_ext._20230101103000.png
 
-    # --- Keyboard Navigation Tests ---
+    # --- Keyboard Navigation & Path Normalization Tests ---
 
-    @patch('image_viewer.Image.open') # To prevent actual image loading
-    @patch('image_viewer.os')
-    def test_open_image_populates_image_list_and_index(self, mock_os, mock_image_open):
-        """Test that open_image correctly scans directory and sets image_list/index."""
-        mock_image_open.return_value = self.mock_pil_image # Simulate successful image open
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os') # Mock the entire os module used by image_viewer
+    def test_open_image_populates_image_list_and_index_with_normalization(self, mock_os_module, mock_image_open):
+        """Test directory scanning with path normalization."""
+        mock_image_open.return_value = self.mock_pil_image
 
-        # Configure os mocks
-        fake_dir = '/fake/directory'
-        current_file = 'img2.JPG'
-        current_filepath = os.path.join(fake_dir, current_file)
+        # Setup mock os module functions
+        fake_dir_unnormalized = '/fake/./directory' # Path with components needing normalization
+        fake_dir_normalized = os.path.normcase(os.path.abspath(fake_dir_unnormalized))
 
-        mock_os.path.dirname.return_value = fake_dir
-        mock_os.listdir.return_value = ['img1.png', 'img2.JPG', 'text.txt', 'img3.bmp', 'IMG0.gif', 'subdir']
+        # File to open (varied case)
+        current_file_unnormalized = 'img2.JPG' 
+        current_filepath_unnormalized = os.path.join(fake_dir_unnormalized, current_file_unnormalized)
         
-        # Define side effect for os.path.isfile
+        # Expected normalized path for the opened image
+        expected_opened_path_normalized = os.path.normcase(os.path.abspath(current_filepath_unnormalized))
+
+        # Mock os.path functions
+        mock_os_module.path.dirname.return_value = fake_dir_unnormalized # dirname is called on the input path
+        mock_os_module.path.abspath.side_effect = os.path.abspath # Use real abspath
+        mock_os_module.path.normcase.side_effect = os.path.normcase # Use real normcase
+        mock_os_module.path.join.side_effect = os.path.join # Use real join
+        
+        # Mock os.listdir to return names that also might need normalization/casing adjustments
+        mock_os_module.listdir.return_value = ['img1.png', 'IMG2.jpg', 'text.txt', 'img3.bmp', 'IMG0.gif', 'subdir']
+        
         def isfile_side_effect(path):
-            # Only files in our listdir mock are files, subdir is not.
+            # This path will be already joined by os.path.join
+            # We need to compare with the names os.listdir returns
             return os.path.basename(path) != 'subdir'
-        mock_os.path.isfile.side_effect = isfile_side_effect
-        mock_os.path.join.side_effect = os.path.join # Use real join
+        mock_os_module.path.isfile.side_effect = isfile_side_effect
 
-        # Call open_image with a specific filepath to trigger directory scanning
-        self.viewer.open_image(filepath=current_filepath)
+        # Call open_image with the unnormalized path
+        self.viewer.open_image(filepath=current_filepath_unnormalized)
 
-        expected_image_list = [
-            os.path.join(fake_dir, 'IMG0.gif'), # Sorted order
-            os.path.join(fake_dir, 'img1.png'),
-            os.path.join(fake_dir, 'img2.JPG'),
-            os.path.join(fake_dir, 'img3.bmp'),
-        ]
-        self.assertEqual(self.viewer.image_list, expected_image_list)
-        self.assertEqual(self.viewer.current_image_index, 2) # Index of img2.JPG
+        # Assert that self.viewer.image_path is normalized
+        self.assertEqual(self.viewer.image_path, expected_opened_path_normalized)
+
+        # Construct expected_image_list with normalized paths
+        expected_image_list_normalized = sorted([
+            os.path.normcase(os.path.abspath(os.path.join(fake_dir_unnormalized, 'IMG0.gif'))),
+            os.path.normcase(os.path.abspath(os.path.join(fake_dir_unnormalized, 'img1.png'))),
+            os.path.normcase(os.path.abspath(os.path.join(fake_dir_unnormalized, 'IMG2.jpg'))), # Note: IMG2.jpg from listdir
+            os.path.normcase(os.path.abspath(os.path.join(fake_dir_unnormalized, 'img3.bmp'))),
+        ])
+        
+        self.assertEqual(self.viewer.image_list, expected_image_list_normalized)
+        
+        # Find the index of the *opened* image (expected_opened_path_normalized)
+        # which should match IMG2.jpg from listdir after normalization
+        # If current_filepath_unnormalized was 'img2.JPG', its normalized form should match one in the list.
+        # The file 'IMG2.jpg' from listdir, when normalized, should match 'img2.JPG' normalized.
+        
+        # Need to find the expected index carefully based on the opened path.
+        # The opened path is current_filepath_unnormalized ('img2.JPG').
+        # Its normalized form is expected_opened_path_normalized.
+        # The list contains normalized 'IMG2.jpg'. These should match if normcase works.
+        try:
+            expected_index = expected_image_list_normalized.index(expected_opened_path_normalized)
+        except ValueError:
+            self.fail(f"Normalized opened path {expected_opened_path_normalized} not found in normalized list {expected_image_list_normalized}")
+
+        self.assertEqual(self.viewer.current_image_index, expected_index)
+
 
     @patch('image_viewer.Image.open')
     @patch('image_viewer.os')
@@ -596,6 +628,96 @@ class TestImageViewerLogic(unittest.TestCase):
         self.viewer.current_image_index = -1 # Invalid index
         self.viewer._load_adjacent_image(1)
         mock_open_image_method.assert_not_called()
+
+    # --- Fit-to-Window on Resize Tests ---
+    def test_fit_image_to_canvas_logic(self):
+        """Test the _fit_image_to_canvas method directly."""
+        self.viewer.image = self.mock_pil_image # 1000x750
+        
+        # Case 1: Image larger than canvas, landscape canvas
+        self.viewer._fit_image_to_canvas(target_canvas_width=500, target_canvas_height=300)
+        # Width ratio: 500/1000 = 0.5. Height ratio: 300/750 = 0.4. Min ratio = 0.4
+        self.assertAlmostEqual(self.viewer.zoom_factor, 0.4)
+        expected_w, expected_h = 1000 * 0.4, 750 * 0.4 # 400, 300
+        self.assertAlmostEqual(self.viewer.image_x, (500 - expected_w) / 2) # (500-400)/2 = 50
+        self.assertAlmostEqual(self.viewer.image_y, (300 - expected_h) / 2) # (300-300)/2 = 0
+
+        # Case 2: Image smaller than canvas
+        self.viewer._fit_image_to_canvas(target_canvas_width=2000, target_canvas_height=1500)
+        # Width ratio: 2000/1000 = 2. Height ratio: 1500/750 = 2. Min ratio = 2
+        self.assertAlmostEqual(self.viewer.zoom_factor, 2.0)
+        expected_w, expected_h = 1000 * 2.0, 750 * 2.0 # 2000, 1500
+        self.assertAlmostEqual(self.viewer.image_x, (2000 - expected_w) / 2) # 0
+        self.assertAlmostEqual(self.viewer.image_y, (1500 - expected_h) / 2) # 0
+
+        # Case 3: Canvas forces letterboxing (image aspect wider than canvas aspect)
+        self.viewer.image.size = (1000, 500) # Image 2:1
+        self.viewer._fit_image_to_canvas(target_canvas_width=500, target_canvas_height=500) # Canvas 1:1
+        # Width ratio: 500/1000 = 0.5. Height ratio: 500/500 = 1.0. Min ratio = 0.5
+        self.assertAlmostEqual(self.viewer.zoom_factor, 0.5)
+        expected_w, expected_h = 1000 * 0.5, 500 * 0.5 # 500, 250
+        self.assertAlmostEqual(self.viewer.image_x, (500 - expected_w) / 2) # 0
+        self.assertAlmostEqual(self.viewer.image_y, (500 - expected_h) / 2) # (500-250)/2 = 125
+
+        # Case 4: Zero dimension canvas (should default to zoom 1.0)
+        self.viewer.image.size = (1000,750) # Reset
+        self.viewer._fit_image_to_canvas(target_canvas_width=0, target_canvas_height=500)
+        self.assertAlmostEqual(self.viewer.zoom_factor, 1.0)
+
+    def test_handle_window_resize_debounces_update(self):
+        """Test that handle_window_resize correctly debounces calls."""
+        self.viewer.resize_debounce_timer = "old_timer_id" # Simulate existing timer
+        mock_event = Mock(widget=self.viewer.master) # Simulate event on master
+
+        self.viewer.master.after.return_value = "new_timer_id" # For the new timer
+
+        self.viewer.handle_window_resize(mock_event)
+
+        self.viewer.master.after_cancel.assert_called_once_with("old_timer_id")
+        self.viewer.master.after.assert_called_once_with(200, self.viewer._perform_fit_to_window_update)
+        self.assertEqual(self.viewer.resize_debounce_timer, "new_timer_id")
+    
+    def test_handle_window_resize_ignores_other_widget_events(self):
+        mock_event = Mock(widget=self.viewer.canvas) # Event from a different widget
+        self.viewer.handle_window_resize(mock_event)
+        self.viewer.master.after_cancel.assert_not_called()
+        self.viewer.master.after.assert_not_called()
+
+
+    def test_perform_fit_to_window_update_calls_fit_and_display(self):
+        """Test _perform_fit_to_window_update logic."""
+        self.viewer.image = self.mock_pil_image # Ensure image is loaded
+        self.viewer.resize_debounce_timer = "some_timer_id"
+
+        with patch.object(self.viewer, '_fit_image_to_canvas', return_value=True) as mock_fit, \
+             patch.object(self.viewer, 'update_display') as mock_update_display:
+            
+            self.viewer._perform_fit_to_window_update()
+
+            mock_fit.assert_called_once()
+            mock_update_display.assert_called_once()
+            self.assertIsNone(self.viewer.resize_debounce_timer)
+
+    def test_perform_fit_to_window_update_no_image(self):
+        self.viewer.image = None
+        with patch.object(self.viewer, '_fit_image_to_canvas') as mock_fit, \
+             patch.object(self.viewer, 'update_display') as mock_update_display:
+            self.viewer._perform_fit_to_window_update()
+            mock_fit.assert_not_called() # Should not be called if no image
+            mock_update_display.assert_not_called()
+
+    # --- Ctrl+O Shortcut Test ---
+    @patch('image_viewer.filedialog.askopenfilename') # Patch where it's used
+    def test_ctrl_o_shortcut_triggers_open_image_dialog(self, mock_askopenfilename):
+        """Test that Ctrl+O shortcut triggers the open image dialog via open_image()."""
+        # The binding is master.bind('<Control-o>', lambda event: self.open_image())
+        # We need to get this lambda or simulate its effect.
+        # Directly calling open_image() with no args is equivalent to what the lambda does.
+        
+        # Simulate the call that the lambda would make
+        self.viewer.open_image() 
+        
+        mock_askopenfilename.assert_called_once()
 
 
 if __name__ == '__main__':

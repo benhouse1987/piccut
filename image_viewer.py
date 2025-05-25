@@ -37,6 +37,7 @@ class ImageViewer:
         self.image_on_canvas = None # ID of the image item on the canvas.
         self.image_path = None # Path to the currently loaded image.
         self.zoom_debounce_timer = None # Timer for debouncing zoom operations
+        self.resize_debounce_timer = None # Timer for debouncing window resize fitting
         self.image_list = [] # List of image files in the current directory
         self.current_image_index = -1 # Index of the current image in image_list
 
@@ -76,6 +77,48 @@ class ImageViewer:
         # Bind Left/Right arrow keys for image navigation (handler to be implemented)
         master.bind('<Left>', self.handle_arrow_key_event)
         master.bind('<Right>', self.handle_arrow_key_event)
+        # Bind window resize event
+        master.bind('<Configure>', self.handle_window_resize)
+        # Bind Ctrl+O to open_image method
+        master.bind('<Control-o>', lambda event: self.open_image())
+
+    def _fit_image_to_canvas(self, target_canvas_width=None, target_canvas_height=None):
+        """
+        Calculates zoom_factor, image_x, and image_y to fit the current image
+        into the target canvas dimensions and centers it.
+
+        Args:
+            target_canvas_width (int, optional): The width to fit into. Defaults to current canvas width.
+            target_canvas_height (int, optional): The height to fit into. Defaults to current canvas height.
+        
+        Returns:
+            bool: True if fitting was calculated, False otherwise (e.g., no image).
+        """
+        if not self.image:
+            return False
+
+        if target_canvas_width is None:
+            target_canvas_width = self.canvas.winfo_width()
+        if target_canvas_height is None:
+            target_canvas_height = self.canvas.winfo_height()
+
+        img_width, img_height = self.image.size
+
+        if img_width <= 0 or img_height <= 0 or target_canvas_width <= 0 or target_canvas_height <= 0:
+            self.zoom_factor = 1.0
+        else:
+            width_ratio = target_canvas_width / img_width
+            height_ratio = target_canvas_height / img_height
+            self.zoom_factor = min(width_ratio, height_ratio)
+            if self.zoom_factor <= 0: # Fallback, should not happen with positive dimensions
+                self.zoom_factor = 1.0
+        
+        new_width = int(img_width * self.zoom_factor)
+        new_height = int(img_height * self.zoom_factor)
+
+        self.image_x = (target_canvas_width - new_width) / 2
+        self.image_y = (target_canvas_height - new_height) / 2
+        return True
 
     def open_image(self, filepath=None): # Modified to accept optional filepath
         """
@@ -110,38 +153,12 @@ class ImageViewer:
             # Attempt to open the image using Pillow.
             new_image = Image.open(filepath)
             self.image = new_image
-            self.image_path = filepath # Store image path on successful load
+            # Normalize and store the image path
+            self.image_path = os.path.normcase(os.path.abspath(filepath))
             
-            # --- Fit image to window initially ---
-            self.master.update_idletasks() # Ensure canvas dimensions are current.
-            canvas_width = self.canvas.winfo_width()
-            canvas_height = self.canvas.winfo_height()
-            img_width, img_height = self.image.size
-
-            if img_width <= 0 or img_height <= 0 or canvas_width <= 0 or canvas_height <= 0:
-                # If any dimension is zero/negative, default to zoom 1.0 and simple centering.
-                self.zoom_factor = 1.0
-                new_scaled_width = img_width
-                new_scaled_height = img_height
-            else:
-                width_ratio = canvas_width / img_width
-                height_ratio = canvas_height / img_height
-                self.zoom_factor = min(width_ratio, height_ratio)
-
-                # If zoom_factor makes image extremely small or negative (shouldn't happen with min of positive ratios)
-                # or if image is already smaller than canvas (ratios > 1), let it scale up to fit.
-                # If min_ratio makes image too small (e.g. very thin canvas), limit zoom_out.
-                # For now, the min(width_ratio, height_ratio) logic is kept.
-                # Ensure zoom_factor is not zero or negative.
-                if self.zoom_factor <= 0:
-                    self.zoom_factor = 1.0 # Fallback
-
-                new_scaled_width = int(img_width * self.zoom_factor)
-                new_scaled_height = int(img_height * self.zoom_factor)
-            
-            # Center the initially fitted image.
-            self.image_x = (canvas_width - new_scaled_width) / 2
-            self.image_y = (canvas_height - new_scaled_height) / 2
+            # Fit image to window initially using the new helper method
+            self.master.update_idletasks() # Ensure canvas dimensions are current before fitting
+            self._fit_image_to_canvas() 
             
             # Scan directory for other images
             current_dir = os.path.dirname(self.image_path)
@@ -149,7 +166,7 @@ class ImageViewer:
             try:
                 all_files_in_dir = os.listdir(current_dir)
                 self.image_list = sorted([
-                    os.path.join(current_dir, f)
+                    os.path.normcase(os.path.abspath(os.path.join(current_dir, f)))
                     for f in all_files_in_dir
                     if os.path.isfile(os.path.join(current_dir, f)) and \
                        f.lower().endswith(valid_extensions)
@@ -177,7 +194,8 @@ class ImageViewer:
             self.current_image_index = -1
         except Exception as e:
             # Catch other potential Pillow errors (e.g., unrecognized format, truncated file)
-            messagebox.showerror("Error Opening Image", f"Could not open or read image file:\n{filepath}\n\nDetails: {e}")
+            # Use original filepath for error message before it's normalized
+            messagebox.showerror("Error Opening Image", f"Could not open or read image file:\n{filepath if filepath else 'Unknown'}\n\nDetails: {e}")
             self.image = None
             self.image_path = None # Reset path on failure
             self.image_list = []
@@ -468,6 +486,31 @@ class ImageViewer:
             # For example, using tkinter.messagebox.showinfo or a status bar
             # print(f"At {'start' if direction == -1 else 'end'} of image list.")
             # By default, do nothing if out of bounds (no wrapping around)
+
+    def handle_window_resize(self, event):
+        """
+        Handles the window resize event (<Configure>).
+        Debounces the actual refitting logic to avoid excessive updates.
+        """
+        # Check if the event is for the master window itself, not a child widget's configure event
+        # This check might be redundant if only master is bound, but good for safety.
+        if event.widget != self.master:
+            return
+
+        if self.resize_debounce_timer:
+            self.master.after_cancel(self.resize_debounce_timer)
+        
+        self.resize_debounce_timer = self.master.after(200, self._perform_fit_to_window_update) # 200ms delay
+
+    def _perform_fit_to_window_update(self):
+        """
+        Called by the resize debounce timer.
+        Refits the image to the current canvas size and updates the display.
+        """
+        self.resize_debounce_timer = None
+        if self.image:
+            if self._fit_image_to_canvas(): # This updates zoom_factor, image_x, image_y
+                self.update_display()
 
 
 # --- Main Application Setup ---
