@@ -926,6 +926,24 @@ class TestImageViewerLogic(unittest.TestCase):
         
         mock_askopenfilename.assert_called_once()
 
+    # --- Escape Key Tests ---
+    def test_escape_key_binding(self):
+        """Test that the Escape key is bound to the handle_escape_key method."""
+        # Check if master.bind was called with '<Escape>' and the correct handler
+        escape_binding_found = False
+        for call in self.viewer.master.bind.call_args_list:
+            args, _ = call
+            if args[0] == '<Escape>' and args[1] == self.viewer.handle_escape_key:
+                escape_binding_found = True
+                break
+        self.assertTrue(escape_binding_found, "Escape key not bound to handle_escape_key")
+
+    def test_handle_escape_key_calls_destroy(self):
+        """Test that handle_escape_key calls master.destroy."""
+        # self.viewer.master is a MagicMock, so self.viewer.master.destroy is also a mock
+        self.viewer.handle_escape_key() # Call the handler directly
+        self.viewer.master.destroy.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

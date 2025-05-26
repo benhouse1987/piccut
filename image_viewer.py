@@ -828,6 +828,13 @@ class ImageViewer:
         self.anim_current_step = 0
         self._animate_zoom_frame()
 
+    def handle_escape_key(self, event=None):
+        """
+        Handles the Escape key press to exit the application.
+        """
+        # print("Escape key pressed. Exiting application.") # Optional: for logging
+        self.master.destroy()
+
 
 # --- Main Application Setup ---
 if __name__ == '__main__':
