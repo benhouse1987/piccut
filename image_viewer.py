@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, Menu, Canvas, messagebox
 import os
 from datetime import datetime
+import math # Added for rotation calculations
 try:
     from PIL import ImageTk, Image
     PIL_AVAILABLE = True
@@ -9,6 +10,11 @@ except ImportError:
     PIL_AVAILABLE = False
     # Inform the user if Pillow is not installed, as image features will be disabled.
     print("Pillow library not found. Image opening functionality will be disabled.")
+
+# Constants for proxy image handling
+PROXY_CREATION_THRESHOLD_DIM = 6000  # If max(width, height) > this, create proxy
+PROXY_MAX_TARGET_DIM = 6000        # Proxy's max dimension (target for proxy)
+ROTATION_INCREMENT = 5.0           # Degrees for each rotation step
 
 class ImageViewer:
     """
@@ -26,10 +32,17 @@ class ImageViewer:
             master: The root Tkinter window.
         """
         self.master = master
-        master.title("Image Viewer")
+        # Apply borderless and fullscreen attributes early
+        self.master.overrideredirect(True)  # Remove title bar and borders
+        self.master.attributes('-fullscreen', True) # Go fullscreen
+
+        # master.title("Image Viewer") # Title is not visible in borderless fullscreen
 
         # --- Application State ---
-        self.image = None  # Stores the original Pillow Image object.
+        self.image = None  # Stores the working Pillow Image object (original or proxy).
+        self.original_image = None # Stores the true original Pillow Image object.
+        self.original_width = 0    # Width of the true original image.
+        self.original_height = 0   # Height of the true original image.
         self.tk_image = None # Stores the PhotoImage object for display on canvas (kept to avoid garbage collection).
         self.zoom_factor = 1.0  # Current zoom level of the image.
         self.image_x = 0  # Top-left x-coordinate of the image on the canvas.
@@ -41,6 +54,8 @@ class ImageViewer:
         self.image_list = [] # List of image files in the current directory
         self.current_image_index = -1 # Index of the current image in image_list
         self.is_zoomed_to_original_size = False # State for double-click zoom
+        self.current_rotation_angle = 0.0 # Current rotation angle of the image
+        self.rotation_debounce_timer = None # Timer for debouncing rotation operations
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -49,7 +64,7 @@ class ImageViewer:
 
         # --- UI Elements ---
         # Create a Canvas widget for image display.
-        self.canvas = Canvas(master, bg="white", cursor="arrow") # Default cursor is an arrow.
+        self.canvas = Canvas(master, bg="black", cursor="arrow") # Changed background to black
         self.canvas.pack(fill="both", expand=True) # Make canvas fill the window.
 
         # --- Event Bindings ---
@@ -64,15 +79,17 @@ class ImageViewer:
         self.canvas.bind("<ButtonRelease-1>", self.stop_pan)
         # Bind double-click for zoom toggle
         self.canvas.bind('<Double-Button-1>', self.handle_double_click_zoom)
+        # Bind Shift+MouseWheel for rotation
+        self.canvas.bind('<Shift-MouseWheel>', self.handle_rotate_event)
 
-        # Create a menu bar.
-        menubar = Menu(master)
-        filemenu = Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Open...", command=self.open_image, state=tk.NORMAL if PIL_AVAILABLE else tk.DISABLED)
-        filemenu.add_separator()
-        filemenu.add_command(label="Exit", command=master.quit)
-        menubar.add_cascade(label="File", menu=filemenu)
-        master.config(menu=menubar)
+        # --- Menu Bar Removed ---
+        # menubar = Menu(master)
+        # filemenu = Menu(menubar, tearoff=0)
+        # filemenu.add_command(label="Open...", command=self.open_image, state=tk.NORMAL if PIL_AVAILABLE else tk.DISABLED)
+        # filemenu.add_separator()
+        # filemenu.add_command(label="Exit", command=master.quit) # Exit is now handled by Escape key
+        # menubar.add_cascade(label="File", menu=filemenu)
+        # master.config(menu=menubar)
 
         # Bind Ctrl+S for saving the cropped/visible part of the image.
         master.bind('<Control-s>', self.save_cropped_image)
@@ -84,6 +101,8 @@ class ImageViewer:
         master.bind('<Configure>', self.handle_window_resize)
         # Bind Ctrl+O to open_image method
         master.bind('<Control-o>', lambda event: self.open_image())
+        # Bind Escape key to exit application
+        master.bind('<Escape>', self.handle_escape_key)
 
     def _fit_image_to_canvas(self, target_canvas_width=None, target_canvas_height=None):
         """
@@ -105,7 +124,29 @@ class ImageViewer:
         if target_canvas_height is None:
             target_canvas_height = self.canvas.winfo_height()
 
-        img_width, img_height = self.image.size
+        base_image_for_dims = self.image # This is the proxy or original
+
+        if self.current_rotation_angle != 0.0:
+            # Get dimensions of the maximal_inner_rect of the base_image_for_dims when rotated
+            # The _calculate_maximal_inner_rect returns (left, top, right, bottom) of the crop
+            # relative to the expanded rotated image. For fitting, we need the width/height of this rect.
+            # The actual dimensions of the crop are calculated based on the *original* (pre-rotation)
+            # dimensions of the image that was rotated.
+            crop_l, crop_t, crop_r, crop_b = self._calculate_maximal_inner_rect(
+                base_image_for_dims.width, 
+                base_image_for_dims.height, 
+                self.current_rotation_angle
+            )
+            # The effective width and height for fitting is the size of this inner rectangle
+            img_width = crop_r - crop_l
+            img_height = crop_b - crop_t
+            
+            # Ensure dimensions are at least 1 for valid calculations
+            img_width = max(1, img_width)
+            img_height = max(1, img_height)
+        else:
+            img_width, img_height = base_image_for_dims.size
+
 
         if img_width <= 0 or img_height <= 0 or target_canvas_width <= 0 or target_canvas_height <= 0:
             self.zoom_factor = 1.0
@@ -154,15 +195,47 @@ class ImageViewer:
 
         try:
             # Attempt to open the image using Pillow.
-            new_image = Image.open(filepath)
-            self.image = new_image
-            # Normalize and store the image path
+            pil_img = Image.open(filepath) # Load into a local variable first
+            
+            self.original_image = pil_img
+            self.original_width, self.original_height = self.original_image.size
+            self.image = self.original_image # Default to using original
+
+            # Proxy Creation Logic
+            if self.original_width > PROXY_CREATION_THRESHOLD_DIM or \
+               self.original_height > PROXY_CREATION_THRESHOLD_DIM:
+                
+                if self.original_width > self.original_height:
+                    scale_factor = PROXY_MAX_TARGET_DIM / self.original_width
+                    proxy_width = PROXY_MAX_TARGET_DIM
+                    proxy_height = int(self.original_height * scale_factor)
+                else:
+                    scale_factor = PROXY_MAX_TARGET_DIM / self.original_height
+                    proxy_height = PROXY_MAX_TARGET_DIM
+                    proxy_width = int(self.original_width * scale_factor)
+
+                proxy_width = max(1, proxy_width)
+                proxy_height = max(1, proxy_height)
+
+                try:
+                    print(f"Creating proxy: original ({self.original_width}x{self.original_height}), proxy ({proxy_width}x{proxy_height})")
+                    self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
+                except Exception as e:
+                    print(f"Error creating proxy: {e}")
+                    self.image = self.original_image # Fallback to original
+            else:
+                print(f"Using original image: ({self.original_width}x{self.original_height})")
+                pass # self.image already points to self.original_image
+
+            # Normalize and store the image path (using the original filepath)
             self.image_path = os.path.normcase(os.path.abspath(filepath))
             
             # Fit image to window initially using the new helper method
+            # This will now use self.image (which could be the proxy)
             self.master.update_idletasks() # Ensure canvas dimensions are current before fitting
-            if self._fit_image_to_canvas():
+            if self._fit_image_to_canvas(): # _fit_image_to_canvas uses self.image.size
                 self.is_zoomed_to_original_size = False
+            self.current_rotation_angle = 0.0 # Reset rotation for new image
             
             # Scan directory for other images
             current_dir = os.path.dirname(self.image_path)
@@ -192,18 +265,26 @@ class ImageViewer:
 
         except FileNotFoundError:
             messagebox.showerror("Error", f"File not found: {filepath}")
-            self.image = None 
+            self.image = None
+            self.original_image = None
+            self.original_width = 0
+            self.original_height = 0
             self.image_path = None # Reset path on failure
             self.image_list = []
             self.current_image_index = -1
+            self.current_rotation_angle = 0.0
         except Exception as e:
             # Catch other potential Pillow errors (e.g., unrecognized format, truncated file)
             # Use original filepath for error message before it's normalized
             messagebox.showerror("Error Opening Image", f"Could not open or read image file:\n{filepath if filepath else 'Unknown'}\n\nDetails: {e}")
             self.image = None
+            self.original_image = None
+            self.original_width = 0
+            self.original_height = 0
             self.image_path = None # Reset path on failure
             self.image_list = []
             self.current_image_index = -1
+            self.current_rotation_angle = 0.0
 
     def update_display(self):
         """
@@ -213,31 +294,74 @@ class ImageViewer:
         then creates a new PhotoImage and places it on the canvas at
         `(self.image_x, self.image_y)`.
         """
-        if self.image is None:
-            return # No image loaded, nothing to display.
+        if self.image is None: 
+            return 
 
-        # Delete the old image from the canvas if it exists.
-        if self.image_on_canvas:
-            self.canvas.delete(self.image_on_canvas)
+        base_image_to_process = self.image # This is the proxy or original
 
-        # Calculate new dimensions, ensuring they are at least 1 pixel.
-        new_width = max(1, int(self.image.width * self.zoom_factor))
-        new_height = max(1, int(self.image.height * self.zoom_factor))
+        image_after_rotation_expanded = base_image_to_process
+        if self.current_rotation_angle != 0.0:
+            try:
+                image_after_rotation_expanded = base_image_to_process.rotate(
+                    -self.current_rotation_angle, 
+                    resample=Image.Resampling.NEAREST, 
+                    expand=True
+                )
+            except Exception as e:
+                print(f"Error during rotation: {e}")
+                # Fallback to using the base image if rotation fails
+        
+        image_to_be_zoomed = image_after_rotation_expanded # Default if no rotation or crop fails
+
+        if self.current_rotation_angle != 0.0:
+            # Auto-crop the expanded rotated image to the maximal inner rectangle
+            # The calculation needs the *pre-rotation* dimensions of the image that was rotated (base_image_to_process)
+            crop_l, crop_t, crop_r, crop_b = self._calculate_maximal_inner_rect(
+                base_image_to_process.width, 
+                base_image_to_process.height, 
+                self.current_rotation_angle
+            )
+            
+            if (crop_r - crop_l) >= 1 and (crop_b - crop_t) >= 1:
+                try:
+                    image_to_be_zoomed = image_after_rotation_expanded.crop((crop_l, crop_t, crop_r, crop_b))
+                except Exception as e:
+                    print(f"Error during auto-crop: {e}")
+                    # Fallback if crop fails, use expanded rotated image
+            elif image_after_rotation_expanded.width == 0 or image_after_rotation_expanded.height == 0:
+                 image_to_be_zoomed = Image.new("RGBA", (1,1), (0,0,0,0)) # Placeholder for safety
+
+        # Dimensions for zoom calculation are now from the (potentially cropped) image_to_be_zoomed
+        current_display_width, current_display_height = image_to_be_zoomed.size
+        if current_display_width == 0 or current_display_height == 0: # Safety for resize
+            current_display_width = max(1, current_display_width)
+            current_display_height = max(1, current_display_height)
+            # If dimensions became zero (e.g. due to bad crop result), use a placeholder
+            image_to_be_zoomed = Image.new("RGBA", (current_display_width, current_display_height), (0,0,0,0))
+
+        # Calculate Scaled Dimensions (Zoom) based on the (potentially rotated and cropped) image
+        scaled_width = int(current_display_width * self.zoom_factor)
+        scaled_height = int(current_display_height * self.zoom_factor)
+        scaled_width = max(1, scaled_width) # Ensure at least 1x1
+        scaled_height = max(1, scaled_height)
 
         try:
-            # Resize the original image using Pillow's NEAREST filter for maximum speed.
-            resized_image = self.image.resize((new_width, new_height), Image.Resampling.NEAREST)
-            # Convert the Pillow image to a Tkinter PhotoImage.
-            # This PhotoImage must be stored as an instance variable to prevent garbage collection.
-            self.tk_image = ImageTk.PhotoImage(resized_image)
-            
-            # Create the image on the canvas at the current (image_x, image_y) position.
-            self.image_on_canvas = self.canvas.create_image(
-                self.image_x, self.image_y, anchor="nw", image=self.tk_image, tags="image_tag" # Added a tag
+            # Resize for Display
+            image_to_render = image_to_be_zoomed.resize(
+                (scaled_width, scaled_height), 
+                Image.Resampling.NEAREST # Consistent with zoom quality
             )
-            # self.canvas.config(scrollregion=self.canvas.bbox("image_tag")) # Optional: if using scrollbars
+            
+            self.tk_image = ImageTk.PhotoImage(image_to_render)
+
+            if self.image_on_canvas:
+                self.canvas.itemconfig(self.image_on_canvas, image=self.tk_image)
+                self.canvas.coords(self.image_on_canvas, self.image_x, self.image_y)
+            else:
+                self.image_on_canvas = self.canvas.create_image(
+                    self.image_x, self.image_y, anchor="nw", image=self.tk_image, tags="image_tag"
+                )
         except Exception as e:
-            # Catch potential errors during resize or PhotoImage creation.
             messagebox.showerror("Error Updating Display", f"An error occurred while updating the image display: {e}")
             # Consider resetting image or state if display fails critically
             # self.image = None 
@@ -385,7 +509,7 @@ class ImageViewer:
         Args:
             event: The Tkinter event object (optional, for key binding).
         """
-        if self.image is None:
+        if not self.original_image: # Check for the original image first
             messagebox.showinfo("No Image", "No image loaded to save.")
             return
 
@@ -393,41 +517,68 @@ class ImageViewer:
             messagebox.showerror("Error", "Pillow library is not available. Cannot save images.")
             return
 
-        if not self.image_path: # Check if original image path is known
-            messagebox.showerror("Error", "Original image path is not known. Cannot save automatically.")
+        if not self.image_path: # Original image path is needed for saving location
+            messagebox.showerror("Error", "Original image path is not known. Cannot determine save location.")
             return
 
         # Get current dimensions of the canvas.
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
 
-        # --- Calculate Crop Coordinates (existing logic) ---
-        scaled_img_visible_x1 = -self.image_x
-        scaled_img_visible_y1 = -self.image_y
-        scaled_img_visible_x2 = -self.image_x + canvas_width
-        scaled_img_visible_y2 = -self.image_y + canvas_height
+        # --- Calculate Crop Coordinates ---
+        # 1. Visible region on the *zoomed working image* (self.image), in its own coordinate system.
+        #    (self.image_x, self.image_y) is the top-left of the zoomed working image on the canvas.
+        #    So, (0,0) on canvas corresponds to (-self.image_x, -self.image_y) on the zoomed working image.
+        vis_x1_on_working_img_scaled = -self.image_x
+        vis_y1_on_working_img_scaled = -self.image_y
+        vis_x2_on_working_img_scaled = -self.image_x + canvas_width
+        vis_y2_on_working_img_scaled = -self.image_y + canvas_height
         
-        original_img_crop_x1 = scaled_img_visible_x1 / self.zoom_factor
-        original_img_crop_y1 = scaled_img_visible_y1 / self.zoom_factor
-        original_img_crop_x2 = scaled_img_visible_x2 / self.zoom_factor
-        original_img_crop_y2 = scaled_img_visible_y2 / self.zoom_factor
+        # 2. Convert these coordinates to the *unzoomed working image's* coordinate system.
+        crop_x1_on_working_img = vis_x1_on_working_img_scaled / self.zoom_factor
+        crop_y1_on_working_img = vis_y1_on_working_img_scaled / self.zoom_factor
+        crop_x2_on_working_img = vis_x2_on_working_img_scaled / self.zoom_factor
+        crop_y2_on_working_img = vis_y2_on_working_img_scaled / self.zoom_factor
 
-        img_width, img_height = self.image.size
-        final_crop_x1 = max(0, original_img_crop_x1)
-        final_crop_y1 = max(0, original_img_crop_y1)
-        final_crop_x2 = min(img_width, original_img_crop_x2)
-        final_crop_y2 = min(img_height, original_img_crop_y2)
+        # 3. Translate coordinates from working image to original image if a proxy is in use.
+        final_crop_x1_on_original = crop_x1_on_working_img
+        final_crop_y1_on_original = crop_y1_on_working_img
+        final_crop_x2_on_original = crop_x2_on_working_img
+        final_crop_y2_on_original = crop_y2_on_working_img
 
-        if final_crop_x1 >= final_crop_x2 or final_crop_y1 >= final_crop_y2:
+        if self.image is not self.original_image: # Check if proxy is active
+            if self.image.width > 0 and self.image.height > 0: # Avoid division by zero for proxy
+                scale_to_original_x = self.original_width / self.image.width
+                scale_to_original_y = self.original_height / self.image.height
+
+                final_crop_x1_on_original = crop_x1_on_working_img * scale_to_original_x
+                final_crop_y1_on_original = crop_y1_on_working_img * scale_to_original_y
+                final_crop_x2_on_original = crop_x2_on_working_img * scale_to_original_x
+                final_crop_y2_on_original = crop_y2_on_working_img * scale_to_original_y
+            # else: if proxy dimensions are zero, something is very wrong. 
+            #       Proceeding with unscaled coords is unlikely to be correct but avoids crash here.
+            #       Clamping later should handle this.
+
+        # 4. Clamp these coordinates to the boundaries of the *original* image.
+        clamped_crop_x1 = max(0, final_crop_x1_on_original)
+        clamped_crop_y1 = max(0, final_crop_y1_on_original)
+        clamped_crop_x2 = min(self.original_width, final_crop_x2_on_original)
+        clamped_crop_y2 = min(self.original_height, final_crop_y2_on_original)
+        
+        # 5. Validate the final crop box on the original image.
+        #    Ensure coordinates are integers for Pillow's crop method.
+        final_box_for_original = (
+            int(round(clamped_crop_x1)),
+            int(round(clamped_crop_y1)),
+            int(round(clamped_crop_x2)),
+            int(round(clamped_crop_y2))
+        )
+        
+        # Check if the calculated crop box has a valid (positive) width and height
+        if final_box_for_original[0] >= final_box_for_original[2] or \
+           final_box_for_original[1] >= final_box_for_original[3]:
             messagebox.showerror("Error", "No part of the image is visible to save, or the visible area is invalid.")
             return
-
-        crop_box = (
-            int(round(final_crop_x1)),
-            int(round(final_crop_y1)),
-            int(round(final_crop_x2)),
-            int(round(final_crop_y2))
-        )
 
         # --- Construct New File Path ---
         directory = os.path.dirname(self.image_path)
@@ -443,7 +594,7 @@ class ImageViewer:
 
         # --- Save the Image ---
         try:
-            cropped_image = self.image.crop(crop_box)
+            cropped_image = self.original_image.crop(final_box_for_original)
             cropped_image.save(new_filepath)
             messagebox.showinfo("Success", f"Cropped image saved as\n{new_filepath}")
         except Exception as e:
@@ -492,6 +643,39 @@ class ImageViewer:
             # For example, using tkinter.messagebox.showinfo or a status bar
             # print(f"At {'start' if direction == -1 else 'end'} of image list.")
             # By default, do nothing if out of bounds (no wrapping around)
+
+    def handle_rotate_event(self, event):
+        if not self.image:
+            return
+
+        # Cancel any pending rotation update
+        if self.rotation_debounce_timer:
+            self.master.after_cancel(self.rotation_debounce_timer)
+
+        # Determine rotation direction and update angle
+        increment_sign = 0
+        # For Linux, event.num 4 is scroll up, 5 is scroll down (like MouseWheel)
+        # For Windows, event.delta is positive for scroll up, negative for scroll down
+        if event.num == 4 or event.delta > 0: # Typically scroll up / away from user
+            increment_sign = 1  # Clockwise
+        elif event.num == 5 or event.delta < 0: # Typically scroll down / towards user
+            increment_sign = -1 # Counter-clockwise
+        
+        if increment_sign != 0:
+            self.current_rotation_angle = (self.current_rotation_angle + (increment_sign * ROTATION_INCREMENT)) % 360.0
+            # print(f"New angle: {self.current_rotation_angle}") # Temporary log
+
+        self.rotation_debounce_timer = self.master.after(150, self._perform_rotation_update) # 150ms delay
+
+    def _perform_rotation_update(self):
+        if not self.image:
+            return
+        self.rotation_debounce_timer = None
+        print(f"PERFORMING ROTATION UPDATE: Angle {self.current_rotation_angle}") # Placeholder log
+        # In the next step, this will call a modified update_display or similar
+        # For now, to ensure it uses the new angle, we can call update_display
+        # update_display will need to be modified to use self.current_rotation_angle
+        self.update_display() # This will be the subject of the next plan step
 
     def handle_window_resize(self, event):
         """

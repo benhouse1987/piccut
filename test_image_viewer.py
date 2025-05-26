@@ -270,42 +270,44 @@ class TestImageViewerLogic(unittest.TestCase):
     @patch('image_viewer.datetime')
     def common_crop_save_test_logic(self, mock_dt, mock_os_path, 
                                     original_path, expected_crop_box, 
-                                    fixed_timestamp_str="20230101103000"):
+                                    fixed_timestamp_str="20230101103000",
+                                    crop_target_image=None): 
         """
         Refactored helper for testing save_cropped_image.
         Mocks datetime and os.path, calls save_cropped_image, 
         and asserts the crop box and save path.
         """
-        # Setup mocks for datetime and os.path
-        mock_dt.now.return_value = datetime(2023, 1, 1, 10, 30, 0) # Corresponds to fixed_timestamp_str
-        
+        mock_dt.now.return_value = datetime(2023, 1, 1, 10, 30, 0)
         self.viewer.image_path = original_path
         
-        # Configure os.path mocks - these need to be somewhat dynamic based on original_path
         mock_os_path.dirname.return_value = os.path.dirname(original_path)
         mock_os_path.basename.return_value = os.path.basename(original_path)
-        # Let splitext and join use their real implementations for simplicity and correctness
         mock_os_path.splitext.side_effect = os.path.splitext
         mock_os_path.join.side_effect = os.path.join
 
-        # Mock the image's crop and save methods
-        mock_cropped_image = MagicMock()
-        self.viewer.image.crop.return_value = mock_cropped_image
+        mock_cropped_image_result = MagicMock()
         
-        self.viewer.save_cropped_image() # Call the method
+        # Determine which image's crop method to check.
+        # This is crucial for proxy tests where self.original_image.crop is called.
+        target_for_crop_method = crop_target_image if crop_target_image is not None else self.viewer.image
+        
+        # Ensure the target_for_crop_method (e.g. self.viewer.original_image) has a mock 'crop'
+        if not isinstance(target_for_crop_method.crop, MagicMock):
+            target_for_crop_method.crop = MagicMock() # If it's not a mock, make it one for assertion
+        target_for_crop_method.crop.return_value = mock_cropped_image_result
+        
+        self.viewer.save_cropped_image()
 
-        # Assert crop was called with the correct box
-        self.viewer.image.crop.assert_called_once_with(expected_crop_box)
+        target_for_crop_method.crop.assert_called_once_with(expected_crop_box)
         
-        # Construct expected save path
         base, ext = os.path.splitext(os.path.basename(original_path))
-        if not ext: # Handle no extension case from main code
+        if not ext:
             ext = ".png"
         expected_filename = f"{base}_{fixed_timestamp_str}{ext}"
         expected_save_path = os.path.join(os.path.dirname(original_path), expected_filename)
         
-        mock_cropped_image.save.assert_called_once_with(expected_save_path)
-        self.mock_messagebox.showinfo.assert_called_once() # Assuming success
+        mock_cropped_image_result.save.assert_called_once_with(expected_save_path) 
+        self.mock_messagebox.showinfo.assert_called_once()
 
     def test_crop_no_zoom_no_pan_image_larger_than_canvas(self):
         self.set_canvas_dimensions(600, 400)
@@ -436,6 +438,205 @@ class TestImageViewerLogic(unittest.TestCase):
                                          expected_crop_box=expected_crop,
                                          fixed_timestamp_str="20230101103000")
         # Expected filename in common_crop_save_test_logic will be image_empty_ext._20230101103000.png
+
+    # --- Proxy Image Tests ---
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os') # For path operations within open_image
+    def test_open_image_creates_proxy_for_large_image(self, mock_os_module, mock_image_open_func):
+        # Use constants from the module if accessible, otherwise redefine or use values
+        # For simplicity, using values directly here, matching those in image_viewer.py
+        PROXY_CREATION_THRESHOLD_DIM = 6000
+        PROXY_MAX_TARGET_DIM = 6000
+
+        large_width, large_height = PROXY_CREATION_THRESHOLD_DIM + 1000, PROXY_CREATION_THRESHOLD_DIM - 500 # e.g. 7000x5500
+        
+        mock_loaded_image = MagicMock(spec=Image.Image)
+        mock_loaded_image.size = (large_width, large_height)
+        mock_loaded_image.width = large_width
+        mock_loaded_image.height = large_height
+        
+        mock_resized_proxy = MagicMock(spec=Image.Image) # This is what resize should return
+        # Important: Set size for the proxy image as well, as _fit_image_to_canvas will use it
+        if large_width > large_height:
+            expected_proxy_w = PROXY_MAX_TARGET_DIM
+            expected_proxy_h = int(large_height * (PROXY_MAX_TARGET_DIM / large_width))
+        else:
+            expected_proxy_h = PROXY_MAX_TARGET_DIM
+            expected_proxy_w = int(large_width * (PROXY_MAX_TARGET_DIM / large_height))
+        mock_resized_proxy.size = (expected_proxy_w, expected_proxy_h)
+        mock_resized_proxy.width = expected_proxy_w
+        mock_resized_proxy.height = expected_proxy_h
+
+        mock_loaded_image.resize.return_value = mock_resized_proxy
+        mock_image_open_func.return_value = mock_loaded_image
+
+        # Mock os.path functions needed by open_image's directory scanning part
+        mock_os_module.path.dirname.return_value = "/fake/dir"
+        mock_os_module.listdir.return_value = [] # No other images for simplicity of this test
+        mock_os_module.path.abspath.side_effect = lambda x: x # Passthrough
+        mock_os_module.path.normcase.side_effect = lambda x: x # Passthrough
+        mock_os_module.path.join.side_effect = os.path.join
+
+        self.viewer.open_image(filepath="/fake/dir/large_image.png")
+
+        self.assertIs(self.viewer.original_image, mock_loaded_image)
+        self.assertEqual(self.viewer.original_width, large_width)
+        self.assertEqual(self.viewer.original_height, large_height)
+        self.assertIsNot(self.viewer.image, self.viewer.original_image, "Proxy should be different from original")
+        self.assertIs(self.viewer.image, mock_resized_proxy, "Proxy should be the resized image")
+        
+        mock_loaded_image.resize.assert_called_once_with(
+            (expected_proxy_w, expected_proxy_h), Image.Resampling.BICUBIC
+        )
+
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os')
+    def test_open_image_uses_original_for_small_image(self, mock_os_module, mock_image_open_func):
+        small_width, small_height = 1000, 800
+        mock_loaded_image = MagicMock(spec=Image.Image)
+        mock_loaded_image.size = (small_width, small_height)
+        mock_loaded_image.width = small_width
+        mock_loaded_image.height = small_height
+        mock_image_open_func.return_value = mock_loaded_image
+
+        mock_os_module.path.dirname.return_value = "/fake/dir"
+        mock_os_module.listdir.return_value = []
+        mock_os_module.path.abspath.side_effect = lambda x: x
+        mock_os_module.path.normcase.side_effect = lambda x: x
+        mock_os_module.path.join.side_effect = os.path.join
+
+
+        self.viewer.open_image(filepath="/fake/dir/small_image.png")
+
+        self.assertIs(self.viewer.original_image, mock_loaded_image)
+        self.assertEqual(self.viewer.original_width, small_width)
+        self.assertEqual(self.viewer.original_height, small_height)
+        self.assertIs(self.viewer.image, self.viewer.original_image) # Original is used
+        mock_loaded_image.resize.assert_not_called() # Resize for proxy creation not called
+
+    @patch('image_viewer.Image.open')
+    @patch('image_viewer.os')
+    def test_open_image_handles_proxy_creation_failure(self, mock_os_module, mock_image_open_func):
+        PROXY_CREATION_THRESHOLD_DIM = 6000
+        large_width, large_height = PROXY_CREATION_THRESHOLD_DIM + 100, PROXY_CREATION_THRESHOLD_DIM + 100
+
+        mock_loaded_image = MagicMock(spec=Image.Image)
+        mock_loaded_image.size = (large_width, large_height)
+        mock_loaded_image.width = large_width
+        mock_loaded_image.height = large_height
+        mock_loaded_image.resize.side_effect = Exception("Resize error") # Simulate failure
+        mock_image_open_func.return_value = mock_loaded_image
+        
+        mock_os_module.path.dirname.return_value = "/fake/dir"
+        mock_os_module.listdir.return_value = []
+        mock_os_module.path.abspath.side_effect = lambda x: x
+        mock_os_module.path.normcase.side_effect = lambda x: x
+        mock_os_module.path.join.side_effect = os.path.join
+
+        self.viewer.open_image(filepath="/fake/dir/large_image_fail_proxy.png")
+
+        self.assertIs(self.viewer.original_image, mock_loaded_image)
+        self.assertIs(self.viewer.image, self.viewer.original_image) # Fallback to original
+        mock_loaded_image.resize.assert_called_once() # Attempt was made
+
+    @patch('image_viewer.os.path')
+    @patch('image_viewer.datetime')
+    def test_save_cropped_image_with_proxy_translates_coords(self, mock_dt, mock_os_path):
+        # Original image is large, proxy is smaller
+        self.viewer.original_width, self.viewer.original_height = 8000, 6000
+        self.viewer.original_image = MagicMock(spec=Image.Image)
+        self.viewer.original_image.size = (self.viewer.original_width, self.viewer.original_height)
+        
+        # Proxy (self.image is the proxy)
+        proxy_width, proxy_height = 4000, 3000 
+        self.viewer.image = MagicMock(spec=Image.Image)
+        self.viewer.image.size = (proxy_width, proxy_height)
+        self.viewer.image.width = proxy_width
+        self.viewer.image.height = proxy_height
+        
+        self.viewer.image_path = "/fake/dir/proxy_test.png" # Needed for save location
+
+        # View parameters (relative to the proxy image when zoomed)
+        self.viewer.zoom_factor = 2.0 # Zoomed into the proxy
+        self.viewer.image_x = -1000 # Proxy panned left by 1000px
+        self.viewer.image_y = -500  # Proxy panned up by 500px
+        self.set_canvas_dimensions(600, 400) # Canvas size
+
+        # Calculations based on save_cropped_image logic:
+        # 1. Visible part of zoomed proxy, in proxy's own scaled coords:
+        vis_x1_on_proxy_scaled = -self.viewer.image_x # 1000
+        vis_y1_on_proxy_scaled = -self.viewer.image_y # 500
+        vis_x2_on_proxy_scaled = vis_x1_on_proxy_scaled + 600 # 1600
+        vis_y2_on_proxy_scaled = vis_y1_on_proxy_scaled + 400 # 900
+        
+        # 2. Convert to unzoomed proxy coords:
+        crop_x1_on_proxy = vis_x1_on_proxy_scaled / self.viewer.zoom_factor # 1000/2 = 500
+        crop_y1_on_proxy = vis_y1_on_proxy_scaled / self.viewer.zoom_factor # 500/2 = 250
+        crop_x2_on_proxy = vis_x2_on_proxy_scaled / self.viewer.zoom_factor # 1600/2 = 800
+        crop_y2_on_proxy = vis_y2_on_proxy_scaled / self.viewer.zoom_factor # 900/2 = 450
+
+        # 3. Translate to original image coords:
+        scale_to_original_x = self.viewer.original_width / proxy_width   # 8000/4000 = 2
+        scale_to_original_y = self.viewer.original_height / proxy_height # 6000/3000 = 2
+        
+        final_crop_x1_on_original = crop_x1_on_proxy * scale_to_original_x # 500*2 = 1000
+        final_crop_y1_on_original = crop_y1_on_proxy * scale_to_original_y # 250*2 = 500
+        final_crop_x2_on_original = crop_x2_on_proxy * scale_to_original_x # 800*2 = 1600
+        final_crop_y2_on_original = crop_y2_on_proxy * scale_to_original_y # 450*2 = 900
+        
+        # 4. Clamping (these coords are within original 8000x6000)
+        expected_crop_box_on_original = (
+            int(round(final_crop_x1_on_original)), # 1000
+            int(round(final_crop_y1_on_original)), # 500
+            int(round(final_crop_x2_on_original)), # 1600
+            int(round(final_crop_y2_on_original))  # 900
+        )
+        
+        self.common_crop_save_test_logic(mock_dt, mock_os_path, 
+                                         original_path=self.viewer.image_path, 
+                                         expected_crop_box=expected_crop_box_on_original,
+                                         crop_target_image=self.viewer.original_image) # Crucial: assert on original_image
+
+    @patch('image_viewer.os.path')
+    @patch('image_viewer.datetime')
+    def test_save_cropped_image_no_proxy_uses_direct_coords(self, mock_dt, mock_os_path):
+        # Original image is small enough, no proxy
+        self.viewer.original_width, self.viewer.original_height = 1000, 750
+        self.viewer.original_image = MagicMock(spec=Image.Image)
+        self.viewer.original_image.size = (self.viewer.original_width, self.viewer.original_height)
+        self.viewer.image = self.viewer.original_image # No proxy
+        
+        self.viewer.image_path = "/fake/dir/no_proxy_test.png"
+
+        self.viewer.zoom_factor = 1.0 # No zoom
+        self.viewer.image_x = -50  # Panned left by 50
+        self.viewer.image_y = -20  # Panned up by 20
+        self.set_canvas_dimensions(300, 200) # Canvas size
+
+        # Calculations:
+        vis_x1_on_img_scaled = -self.viewer.image_x # 50
+        vis_y1_on_img_scaled = -self.viewer.image_y # 20
+        vis_x2_on_img_scaled = vis_x1_on_img_scaled + 300 # 350
+        vis_y2_on_img_scaled = vis_y1_on_img_scaled + 200 # 220
+        
+        crop_x1 = vis_x1_on_img_scaled / self.viewer.zoom_factor # 50
+        crop_y1 = vis_y1_on_img_scaled / self.viewer.zoom_factor # 20
+        crop_x2 = vis_x2_on_img_scaled / self.viewer.zoom_factor # 350
+        crop_y2 = vis_y2_on_img_scaled / self.viewer.zoom_factor # 220
+        
+        # Clamping to original 1000x750
+        expected_crop_box = (
+            int(round(max(0, crop_x1))), # 50
+            int(round(max(0, crop_y1))), # 20
+            int(round(min(self.viewer.original_width, crop_x2))),  # 350
+            int(round(min(self.viewer.original_height, crop_y2))) # 220
+        )
+        
+        self.common_crop_save_test_logic(mock_dt, mock_os_path, 
+                                         original_path=self.viewer.image_path, 
+                                         expected_crop_box=expected_crop_box,
+                                         crop_target_image=self.viewer.original_image)
+
 
     # --- Keyboard Navigation & Path Normalization Tests ---
 
