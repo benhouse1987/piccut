@@ -13,7 +13,7 @@ except ImportError:
 
 # Constants for proxy image handling
 PROXY_CREATION_THRESHOLD_DIM = 6000  # If max(width, height) > this, create proxy
-PROXY_MAX_TARGET_DIM = 6000        # Proxy's max dimension (target for proxy)
+PROXY_MAX_TARGET_DIM = 3000        # Proxy's max dimension (target for proxy)
 ROTATION_INCREMENT = 5.0           # Degrees for each rotation step
 # Animation Constants
 ANIMATION_DURATION_MS = 200  # Total duration of zoom animation
@@ -36,15 +36,22 @@ class ImageViewer:
             master: The root Tkinter window.
         """
         self.master = master
-        # Apply borderless and fullscreen attributes early
-        self.master.overrideredirect(True)  # Remove title bar and borders
-        # self.master.attributes('-fullscreen', True) # This conflicts with overrideredirect on some systems
 
-        # Manually set geometry to fill the screen for a fullscreen effect
-        screen_width = self.master.winfo_screenwidth()
-        screen_height = self.master.winfo_screenheight()
-        self.master.geometry(f"{screen_width}x{screen_height}+0+0")
-
+        # Attempt to set true fullscreen first, then make it borderless.
+        # If this specific order causes a TclError on some systems, fallback.
+        try:
+            self.master.attributes('-fullscreen', True)
+            self.master.overrideredirect(True) 
+            print("Successfully set fullscreen then overrideredirect.") # Temporary log
+        except tk.TclError as e:
+            print(f"TclError with fullscreen then overrideredirect: {e}") # Temporary log
+            # Fallback to previous manual geometry method if the above fails
+            self.master.overrideredirect(True) # Ensure borderless
+            screen_width = self.master.winfo_screenwidth()
+            screen_height = self.master.winfo_screenheight()
+            self.master.geometry(f"{screen_width}x{screen_height}+0+0")
+            print("Fell back to manual geometry for fullscreen effect.") # Temporary log
+        
         # master.title("Image Viewer") # Title is not visible in borderless fullscreen
 
         # --- Application State ---

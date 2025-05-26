@@ -445,10 +445,13 @@ class TestImageViewerLogic(unittest.TestCase):
     def test_open_image_creates_proxy_for_large_image(self, mock_os_module, mock_image_open_func):
         # Use constants from the module if accessible, otherwise redefine or use values
         # For simplicity, using values directly here, matching those in image_viewer.py
-        PROXY_CREATION_THRESHOLD_DIM = 6000
-        PROXY_MAX_TARGET_DIM = 6000
+        PROXY_CREATION_THRESHOLD_DIM = 6000 # This remains unchanged
+        PROXY_MAX_TARGET_DIM_FOR_TEST = 3000 # Updated for this test to match new app logic
 
-        large_width, large_height = PROXY_CREATION_THRESHOLD_DIM + 1000, PROXY_CREATION_THRESHOLD_DIM - 500 # e.g. 7000x5500
+        # Example large image dimensions (ensure one dimension is > PROXY_CREATION_THRESHOLD_DIM)
+        # Let's use dimensions where width is greater to specifically test that path.
+        large_width, large_height = PROXY_CREATION_THRESHOLD_DIM + 1000, PROXY_CREATION_THRESHOLD_DIM - 1000 
+        # e.g., 7000x5000. Original PROXY_MAX_TARGET_DIM was 6000, now 3000 for test.
         
         mock_loaded_image = MagicMock(spec=Image.Image)
         mock_loaded_image.size = (large_width, large_height)
@@ -456,13 +459,22 @@ class TestImageViewerLogic(unittest.TestCase):
         mock_loaded_image.height = large_height
         
         mock_resized_proxy = MagicMock(spec=Image.Image) # This is what resize should return
-        # Important: Set size for the proxy image as well, as _fit_image_to_canvas will use it
+        
+        # Calculate expected proxy dimensions based on PROXY_MAX_TARGET_DIM_FOR_TEST (3000)
+        # This logic mirrors the one in image_viewer.py
         if large_width > large_height:
-            expected_proxy_w = PROXY_MAX_TARGET_DIM
-            expected_proxy_h = int(large_height * (PROXY_MAX_TARGET_DIM / large_width))
+            scale_factor = PROXY_MAX_TARGET_DIM_FOR_TEST / large_width
+            expected_proxy_w = PROXY_MAX_TARGET_DIM_FOR_TEST
+            expected_proxy_h = int(large_height * scale_factor)
         else:
-            expected_proxy_h = PROXY_MAX_TARGET_DIM
-            expected_proxy_w = int(large_width * (PROXY_MAX_TARGET_DIM / large_height))
+            scale_factor = PROXY_MAX_TARGET_DIM_FOR_TEST / large_height
+            expected_proxy_h = PROXY_MAX_TARGET_DIM_FOR_TEST
+            expected_proxy_w = int(large_width * scale_factor)
+        
+        # Ensure dimensions are at least 1 (matching image_viewer.py logic)
+        expected_proxy_w = max(1, expected_proxy_w)
+        expected_proxy_h = max(1, expected_proxy_h)
+
         mock_resized_proxy.size = (expected_proxy_w, expected_proxy_h)
         mock_resized_proxy.width = expected_proxy_w
         mock_resized_proxy.height = expected_proxy_h
