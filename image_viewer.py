@@ -65,7 +65,7 @@ class ImageViewer:
         self.image_y = 0  # Top-left y-coordinate of the image on the canvas.
         self.image_on_canvas = None # ID of the image item on the canvas.
         self.image_path = None # Path to the currently loaded image.
-        self.zoom_debounce_timer = None # Timer for debouncing zoom operations
+        # self.zoom_debounce_timer = None # Timer for debouncing zoom operations - REMOVED
         self.resize_debounce_timer = None # Timer for debouncing window resize fitting
         self.image_list = [] # List of image files in the current directory
         self.current_image_index = -1 # Index of the current image in image_list
@@ -451,33 +451,23 @@ class ImageViewer:
         self.anim_target_x = mouse_x - (img_coord_x * self.anim_target_zoom)
         self.anim_target_y = mouse_y - (img_coord_y * self.anim_target_zoom)
 
-        # Debounce the start of the animation
-        if self.zoom_debounce_timer:
-            self.master.after_cancel(self.zoom_debounce_timer)
-        
-        self.zoom_debounce_timer = self.master.after(100, self._perform_zoom_update)
-
-    def _perform_zoom_update(self):
-        """
-        Called by the zoom debounce timer. Initiates the zoom animation.
-        """
-        if not self.image:
-            return
-        self.zoom_debounce_timer = None 
-
-        # If there's an old animation running, ensure it's stopped.
+        # --- Start of new logic ---
+        # If there's an old animation running, ensure it's stopped before starting a new one.
         if self.animation_timer_id:
             self.master.after_cancel(self.animation_timer_id)
-            self.animation_timer_id = None
+            self.animation_timer_id = None # Clear the ID
 
-        # Setup for the new animation sequence
+        # Setup for the new animation sequence, starting from the current animated state
         self.anim_start_zoom = self.zoom_factor 
         self.anim_start_x = self.image_x
         self.anim_start_y = self.image_y
-        # Targets (self.anim_target_zoom, _x, _y) are already set by the last call to zoom_image
-        
+        # Targets (self.anim_target_zoom, _x, _y) are already set by the logic above in zoom_image
+
         self.anim_current_step = 0
         self._animate_zoom_frame() 
+        # --- End of new logic ---
+
+    # _perform_zoom_update method removed as its logic is integrated above
 
     def _animate_zoom_frame(self):
         """
@@ -491,11 +481,8 @@ class ImageViewer:
             self.image_x = self.anim_target_x
             self.image_y = self.anim_target_y
             self.animation_timer_id = None
-            if self.zoom_factor == 1.0: # Check if it's 100% zoom
-                 # This might need adjustment if fit-to-window can also result in zoom_factor 1.0
-                 # For now, assume only direct 100% zoom sets this.
-                 # self.is_zoomed_to_original_size = True # State update for double-click
-                 pass # is_zoomed_to_original_size is managed by handle_double_click_zoom and zoom_image
+            # if self.zoom_factor == 1.0: # Check if it's 100% zoom # Commenting out original comments
+                 # pass 
         else:
             # Interpolate
             self.zoom_factor = self.anim_start_zoom + \
@@ -507,7 +494,7 @@ class ImageViewer:
             
             delay_per_frame = ANIMATION_DURATION_MS // ANIMATION_TOTAL_STEPS
             self.animation_timer_id = self.master.after(delay_per_frame, self._animate_zoom_frame)
-
+        
         self.update_display() # Render this frame
 
     def start_pan(self, event):
@@ -783,9 +770,7 @@ class ImageViewer:
         if self.animation_timer_id:
             self.master.after_cancel(self.animation_timer_id)
             self.animation_timer_id = None
-        if self.zoom_debounce_timer:
-            self.master.after_cancel(self.zoom_debounce_timer)
-            self.zoom_debounce_timer = None
+        # Removed zoom_debounce_timer cancellation as it's no longer used.
 
         self.anim_start_zoom = self.zoom_factor
         self.anim_start_x = self.image_x
