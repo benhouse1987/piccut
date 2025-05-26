@@ -15,6 +15,10 @@ except ImportError:
 PROXY_CREATION_THRESHOLD_DIM = 6000  # If max(width, height) > this, create proxy
 PROXY_MAX_TARGET_DIM = 6000        # Proxy's max dimension (target for proxy)
 ROTATION_INCREMENT = 5.0           # Degrees for each rotation step
+# Animation Constants
+ANIMATION_DURATION_MS = 200  # Total duration of zoom animation
+ANIMATION_TOTAL_STEPS = 10   # Number of frames in the animation
+
 
 class ImageViewer:
     """
@@ -34,7 +38,12 @@ class ImageViewer:
         self.master = master
         # Apply borderless and fullscreen attributes early
         self.master.overrideredirect(True)  # Remove title bar and borders
-        self.master.attributes('-fullscreen', True) # Go fullscreen
+        # self.master.attributes('-fullscreen', True) # This conflicts with overrideredirect on some systems
+
+        # Manually set geometry to fill the screen for a fullscreen effect
+        screen_width = self.master.winfo_screenwidth()
+        screen_height = self.master.winfo_screenheight()
+        self.master.geometry(f"{screen_width}x{screen_height}+0+0")
 
         # master.title("Image Viewer") # Title is not visible in borderless fullscreen
 
@@ -56,6 +65,16 @@ class ImageViewer:
         self.is_zoomed_to_original_size = False # State for double-click zoom
         self.current_rotation_angle = 0.0 # Current rotation angle of the image
         self.rotation_debounce_timer = None # Timer for debouncing rotation operations
+
+        # --- Animation State ---
+        self.animation_timer_id = None  # For cancelling ongoing animation frame
+        self.anim_start_zoom = 0.0
+        self.anim_start_x = 0.0
+        self.anim_start_y = 0.0
+        self.anim_target_zoom = 0.0 # Target for the current animation segment
+        self.anim_target_x = 0.0
+        self.anim_target_y = 0.0
+        self.anim_current_step = 0
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -381,65 +400,108 @@ class ImageViewer:
                    for scroll direction, and `event.x`, `event.y` for cursor position.
         """
         if self.image is None:
-            return # No image loaded, cannot zoom.
+            return 
         
         self.is_zoomed_to_original_size = False # Any scroll zoom overrides double-click state
 
-        zoom_step = 0.1 # Proportional zoom step.
-        
-        # Store the zoom factor before it's modified by the current event.
-        # This is crucial for correctly calculating the image point under the cursor.
-        previous_zoom_factor = self.zoom_factor
+        # Cancel any ongoing animation frame timer from previous zoom events
+        if self.animation_timer_id:
+            self.master.after_cancel(self.animation_timer_id)
+            self.animation_timer_id = None
+            # When animation is cancelled, current self.zoom_factor, self.image_x, self.image_y
+            # will reflect the last rendered frame of that animation. These become the start
+            # for the new animation calculation initiated by the new scroll.
 
-        # Determine zoom direction based on event properties.
-        if event.num == 4 or event.delta > 0:  # Scroll up (zoom in)
-            self.zoom_factor *= (1 + zoom_step)
-        elif event.num == 5 or event.delta < 0:  # Scroll down (zoom out)
-            self.zoom_factor *= (1 - zoom_step)
+        # Store current state as potential start for animation if debounce doesn't cancel this
+        current_zoom_factor = self.zoom_factor
+        current_image_x = self.image_x
+        current_image_y = self.image_y
+
+        zoom_step = 0.1 
+        
+        # Calculate target zoom factor based on scroll direction
+        target_zoom_factor = current_zoom_factor # Start with current
+        if event.num == 4 or event.delta > 0:
+            target_zoom_factor *= (1 + zoom_step)
+        elif event.num == 5 or event.delta < 0:
+            target_zoom_factor *= (1 - zoom_step)
         else:
-            # This case should ideally not be reached with standard mouse wheels.
             return
         
-        # Clamp the zoom factor to predefined min/max values.
-        self.zoom_factor = max(0.1, min(self.zoom_factor, 5.0)) # Min 10%, Max 500% zoom.
+        target_zoom_factor = max(0.1, min(target_zoom_factor, 5.0))
 
-        # --- Zoom towards cursor logic ---
-        # Get mouse coordinates relative to the canvas.
+        # Calculate target image position (zoom towards cursor)
         mouse_x = event.x
         mouse_y = event.y
+        
+        # Point on the *working* image under the mouse before this proposed zoom
+        # Use `current_zoom_factor` because that's what's currently displayed
+        img_coord_x = (mouse_x - current_image_x) / current_zoom_factor
+        img_coord_y = (mouse_y - current_image_y) / current_zoom_factor
+        
+        # Calculate new top-left to keep this point under the cursor with `target_zoom_factor`
+        self.anim_target_zoom = target_zoom_factor
+        self.anim_target_x = mouse_x - (img_coord_x * self.anim_target_zoom)
+        self.anim_target_y = mouse_y - (img_coord_y * self.anim_target_zoom)
 
-        # Calculate the point on the *original, unzoomed* image that is currently under the mouse cursor.
-        # 1. (mouse_x - self.image_x): x-coordinate of the mouse cursor relative to the top-left of the *currently displayed scaled* image.
-        # 2. Divide by `previous_zoom_factor`: This converts the coordinate from the currently scaled image space back to the original image space.
-        img_coord_x_on_original = (mouse_x - self.image_x) / previous_zoom_factor
-        img_coord_y_on_original = (mouse_y - self.image_y) / previous_zoom_factor
+        # Debounce the start of the animation
+        if self.zoom_debounce_timer:
+            self.master.after_cancel(self.zoom_debounce_timer)
         
-        # Calculate the new top-left position (self.image_x, self.image_y) of the scaled image on the canvas.
-        # The goal is to keep the `img_coord_on_original` point fixed under the mouse cursor after the new zoom.
-        # The new on-canvas position of `img_coord_on_original` (after applying the new self.zoom_factor) would be:
-        #    new_canvas_pos_of_img_point_x = self.image_x + (img_coord_x_on_original * self.zoom_factor)
-        # We want this `new_canvas_pos_of_img_point_x` to be equal to the current `mouse_x`.
-        # So, mouse_x = self.image_x + (img_coord_x_on_original * self.zoom_factor)
-        # Rearranging for self.image_x:
-        self.image_x = mouse_x - (img_coord_x_on_original * self.zoom_factor)
-        self.image_y = mouse_y - (img_coord_y_on_original * self.zoom_factor)
-        
-        # Schedule the actual image update
-        self.zoom_debounce_timer = self.master.after(100, self._perform_zoom_update) # 100ms delay
+        self.zoom_debounce_timer = self.master.after(100, self._perform_zoom_update)
 
     def _perform_zoom_update(self):
         """
-        Performs the actual image update after a debounce delay.
-        This method is called by the timer set in `zoom_image`.
+        Called by the zoom debounce timer. Initiates the zoom animation.
         """
-        if self.image is None: # Check if image is still loaded
+        if not self.image:
             return
+        self.zoom_debounce_timer = None 
 
-        # Reset timer ID since it has now fired
-        self.zoom_debounce_timer = None
+        # If there's an old animation running, ensure it's stopped.
+        if self.animation_timer_id:
+            self.master.after_cancel(self.animation_timer_id)
+            self.animation_timer_id = None
 
-        # Now call update_display with the latest self.zoom_factor, self.image_x, self.image_y
-        self.update_display()
+        # Setup for the new animation sequence
+        self.anim_start_zoom = self.zoom_factor 
+        self.anim_start_x = self.image_x
+        self.anim_start_y = self.image_y
+        # Targets (self.anim_target_zoom, _x, _y) are already set by the last call to zoom_image
+        
+        self.anim_current_step = 0
+        self._animate_zoom_frame() 
+
+    def _animate_zoom_frame(self):
+        """
+        Performs a single frame of the zoom animation.
+        """
+        self.anim_current_step += 1
+        progress = self.anim_current_step / ANIMATION_TOTAL_STEPS
+
+        if self.anim_current_step >= ANIMATION_TOTAL_STEPS:
+            self.zoom_factor = self.anim_target_zoom
+            self.image_x = self.anim_target_x
+            self.image_y = self.anim_target_y
+            self.animation_timer_id = None
+            if self.zoom_factor == 1.0: # Check if it's 100% zoom
+                 # This might need adjustment if fit-to-window can also result in zoom_factor 1.0
+                 # For now, assume only direct 100% zoom sets this.
+                 # self.is_zoomed_to_original_size = True # State update for double-click
+                 pass # is_zoomed_to_original_size is managed by handle_double_click_zoom and zoom_image
+        else:
+            # Interpolate
+            self.zoom_factor = self.anim_start_zoom + \
+                               (self.anim_target_zoom - self.anim_start_zoom) * progress
+            self.image_x = self.anim_start_x + \
+                           (self.anim_target_x - self.anim_start_x) * progress
+            self.image_y = self.anim_start_y + \
+                           (self.anim_target_y - self.anim_start_y) * progress
+            
+            delay_per_frame = ANIMATION_DURATION_MS // ANIMATION_TOTAL_STEPS
+            self.animation_timer_id = self.master.after(delay_per_frame, self._animate_zoom_frame)
+
+        self.update_display() # Render this frame
 
     def start_pan(self, event):
         """
@@ -710,30 +772,61 @@ class ImageViewer:
         if not self.image:
             return
 
+        # Cancel any ongoing zoom animation or debounce timers
+        if self.animation_timer_id:
+            self.master.after_cancel(self.animation_timer_id)
+            self.animation_timer_id = None
+        if self.zoom_debounce_timer:
+            self.master.after_cancel(self.zoom_debounce_timer)
+            self.zoom_debounce_timer = None
+
+        self.anim_start_zoom = self.zoom_factor
+        self.anim_start_x = self.image_x
+        self.anim_start_y = self.image_y
+
         if not self.is_zoomed_to_original_size:
-            # Zoom to 100% (original size) centered at event.x, event.y
-            previous_zoom_factor = self.zoom_factor 
+            # Target: 100% zoom, centered at cursor
+            target_zoom = 1.0
+            # Calculate point on working image under cursor
+            img_coord_x = (event.x - self.image_x) / self.zoom_factor
+            img_coord_y = (event.y - self.image_y) / self.zoom_factor
             
-            # Calculate which point on the original image is under the cursor
-            image_point_x_on_original = (event.x - self.image_x) / previous_zoom_factor
-            image_point_y_on_original = (event.y - self.image_y) / previous_zoom_factor
-
-            self.zoom_factor = 1.0 # Target zoom is 100%
-
-            # Calculate new self.image_x, self.image_y so that image_point_x/y_on_original
-            # is now at canvas event.x, event.y
-            self.image_x = event.x - (image_point_x_on_original * self.zoom_factor)
-            self.image_y = event.y - (image_point_y_on_original * self.zoom_factor)
-            
-            self.is_zoomed_to_original_size = True
+            self.anim_target_zoom = target_zoom
+            self.anim_target_x = event.x - (img_coord_x * self.anim_target_zoom)
+            self.anim_target_y = event.y - (img_coord_y * self.anim_target_zoom)
+            self.is_zoomed_to_original_size = True # Set state based on *target*
         else:
-            # Zoom back to fit-to-window
-            if self._fit_image_to_canvas():
-                self.is_zoomed_to_original_size = False
-            # If _fit_image_to_canvas failed (e.g. no canvas dimensions),
-            # is_zoomed_to_original_size remains true, next double click will try again.
+            # Target: Fit-to-window
+            # Store current canvas dimensions before calling _fit_image_to_canvas
+            # as it might use winfo_width/height if not provided.
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            # _fit_image_to_canvas calculates and sets self.zoom_factor, self.image_x, self.image_y
+            # We need to capture these as targets.
+            temp_zoom = self.zoom_factor # Store current to restore if fit fails
+            temp_x = self.image_x
+            temp_y = self.image_y
+            
+            if self._fit_image_to_canvas(target_canvas_width=canvas_width, target_canvas_height=canvas_height):
+                self.anim_target_zoom = self.zoom_factor
+                self.anim_target_x = self.image_x
+                self.anim_target_y = self.image_y
+                self.is_zoomed_to_original_size = False # Set state based on *target*
+            else: # Fit failed, revert to current state as target (no animation)
+                self.anim_target_zoom = temp_zoom
+                self.anim_target_x = temp_x
+                self.anim_target_y = temp_y
+                # is_zoomed_to_original_size remains True
+                return # No animation if fit failed
+            
+            # Restore actual current state for anim_start values
+            self.zoom_factor = self.anim_start_zoom
+            self.image_x = self.anim_start_x
+            self.image_y = self.anim_start_y
         
-        self.update_display()
+        self.anim_current_step = 0
+        self._animate_zoom_frame()
 
 
 # --- Main Application Setup ---
