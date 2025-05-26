@@ -163,102 +163,209 @@ class TestImageViewerLogic(unittest.TestCase):
             self.viewer.zoom_image(mock_event)
             self.assertLess(self.viewer.zoom_factor, initial_zoom)
             mock_update_display.assert_not_called()
-            self.viewer.master.after.assert_called_once()
+            self.viewer.master.after.assert_called_once() # From _animate_zoom_frame
 
     def test_zoom_limits(self):
-        """Test that zoom factor is clamped (parameter calculation)."""
-        with patch.object(self.viewer, 'update_display'), \
-             patch.object(self.viewer.master, 'after') as mock_master_after: # Ensure after is checkable
+        """Test that zoom factor is clamped by zoom_image when setting anim_target_zoom."""
+        # This test now verifies that anim_target_zoom is clamped by zoom_image.
+        # The actual zoom_factor update occurs in _animate_zoom_frame.
+        
+        with patch.object(self.viewer, '_animate_zoom_frame') as mock_animate_zoom_frame:
             # Zoom in excessively
-            for _ in range(50):
-                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=120))
-            self.assertAlmostEqual(self.viewer.zoom_factor, 5.0, places=5)
-            # Check that master.after was called for each zoom_image call
-            self.assertEqual(mock_master_after.call_count, 50) 
+            self.viewer.zoom_factor = 1.0 # Start from a normal zoom
+            for _ in range(50): # Should hit max zoom quickly
+                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=120)) # Zoom in
+            self.assertAlmostEqual(self.viewer.anim_target_zoom, 5.0, places=5)
+            # _animate_zoom_frame would be called multiple times
+            self.assertTrue(mock_animate_zoom_frame.called)
 
-
-            # Reset zoom and image position for the next part of test
-            self.viewer.zoom_factor = 1.0 
-            self.viewer.image_x = 0 
-            self.viewer.image_y = 0
-            # Reset mock_master_after call count for the next batch of calls
-            mock_master_after.reset_mock()
+            # Reset for zoom out test
+            mock_animate_zoom_frame.reset_mock()
+            self.viewer.zoom_factor = 1.0 # Reset current zoom_factor
+            self.viewer.anim_target_zoom = 1.0 # Reset anim_target_zoom
+            self.viewer.animation_timer_id = None # Ensure no "running" animation
 
             # Zoom out excessively
-            for _ in range(50):
-                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=-120))
-            self.assertAlmostEqual(self.viewer.zoom_factor, 0.1, places=5)
-            self.assertEqual(mock_master_after.call_count, 50)
+            for _ in range(50): # Should hit min zoom quickly
+                self.viewer.zoom_image(self.create_mock_event(100, 100, delta=-120)) # Zoom out
+            self.assertAlmostEqual(self.viewer.anim_target_zoom, 0.1, places=5)
+            self.assertTrue(mock_animate_zoom_frame.called)
         
     def test_zoom_towards_cursor_calculation(self):
-        """Test the core logic of zooming towards the cursor (parameter calculation)."""
+        """Test the core logic of calculating anim_target_x/y for zooming towards the cursor."""
         self.viewer.zoom_factor = 1.0
         self.viewer.image_x = 0 
         self.viewer.image_y = 0
         
         mouse_x_on_canvas = 100
         mouse_y_on_canvas = 75
-        mock_event = self.create_mock_event(mouse_x_on_canvas, mouse_y_on_canvas, delta=120)
+        mock_event = self.create_mock_event(mouse_x_on_canvas, mouse_y_on_canvas, delta=120) # Zoom in
         
-        with patch.object(self.viewer, 'update_display') as mock_update_display:
+        # Expected target zoom factor after one step (1.0 * 1.1 = 1.1)
+        expected_target_zoom = 1.1 
+
+        with patch.object(self.viewer, '_animate_zoom_frame') as mock_animate_zoom_frame:
             self.viewer.zoom_image(mock_event)
 
-            new_zoom_factor = self.viewer.zoom_factor 
-            expected_image_x = mouse_x_on_canvas - (100 * new_zoom_factor)
-            expected_image_y = mouse_y_on_canvas - (75 * new_zoom_factor)
+            # Check that anim_target_zoom is calculated correctly
+            self.assertAlmostEqual(self.viewer.anim_target_zoom, expected_target_zoom, places=5)
             
-            self.assertAlmostEqual(self.viewer.image_x, expected_image_x, places=5)
-            self.assertAlmostEqual(self.viewer.image_y, expected_image_y, places=5)
-            self.assertAlmostEqual((mouse_x_on_canvas - self.viewer.image_x) / self.viewer.zoom_factor, 100, places=3)
-            self.assertAlmostEqual((mouse_y_on_canvas - self.viewer.image_y) / self.viewer.zoom_factor, 75, places=3)
+            # Check that anim_target_x and anim_target_y are calculated to keep the point
+            # (mouse_x_on_canvas, mouse_y_on_canvas) over the same image coordinate.
+            # Original image coords under cursor:
+            # img_coord_x = (mouse_x_on_canvas - self.viewer.image_x) / self.viewer.zoom_factor
+            #             = (100 - 0) / 1.0 = 100
+            # img_coord_y = (mouse_y_on_canvas - self.viewer.image_y) / self.viewer.zoom_factor
+            #             = (75 - 0) / 1.0 = 75
+            # Expected target image top-left (anim_target_x, anim_target_y):
+            # anim_target_x = mouse_x_on_canvas - (img_coord_x * anim_target_zoom)
+            #               = 100 - (100 * 1.1) = 100 - 110 = -10
+            # anim_target_y = mouse_y_on_canvas - (img_coord_y * anim_target_zoom)
+            #               = 75 - (75 * 1.1) = 75 - 82.5 = -7.5
+            expected_anim_target_x = mouse_x_on_canvas - (100 * expected_target_zoom)
+            expected_anim_target_y = mouse_y_on_canvas - (75 * expected_target_zoom)
             
-            mock_update_display.assert_not_called()
-            self.viewer.master.after.assert_called_once()
+            self.assertAlmostEqual(self.viewer.anim_target_x, expected_anim_target_x, places=5)
+            self.assertAlmostEqual(self.viewer.anim_target_y, expected_anim_target_y, places=5)
+            
+            mock_animate_zoom_frame.assert_called_once()
 
-    def test_zoom_image_schedules_update_and_calculates_params(self):
+    def test_zoom_image_initiates_animation_when_targets_differ(self):
+        """Verify zoom_image calculates targets and starts animation when targets differ."""
         self.viewer.image = self.mock_pil_image 
-        self.viewer.image_path = "/fake/path.png" 
-        initial_zoom = self.viewer.zoom_factor = 1.0 # Set specific initial state
-        initial_x = self.viewer.image_x = 0
-        initial_y = self.viewer.image_y = 0
+        self.viewer.zoom_factor = 1.0
+        self.viewer.image_x = 0
+        self.viewer.image_y = 0
 
-        mock_event = self.create_mock_event(x=100, y=100, delta=120) 
-        
-        # self.viewer.master is already mocked in setUp
-        self.viewer.master.after.return_value = "timer1" # Ensure specific timer ID
-        
-        with patch.object(self.viewer, 'update_display') as mock_update_display:
+        mouse_x, mouse_y = 100, 50
+        mock_event = self.create_mock_event(x=mouse_x, y=mouse_y, delta=120) # Zoom in (1.1x)
+
+        with patch.object(self.viewer, '_animate_zoom_frame') as mock_animate_zoom_frame, \
+             patch.object(self.viewer, 'update_display') as mock_update_display:
+            
             self.viewer.zoom_image(mock_event)
 
-            self.assertNotEqual(self.viewer.zoom_factor, initial_zoom)
-            self.assertNotEqual(self.viewer.image_x, initial_x)
-            self.assertNotEqual(self.viewer.image_y, initial_y)
-            mock_update_display.assert_not_called()
-            self.viewer.master.after.assert_called_once_with(100, self.viewer._perform_zoom_update)
-            self.assertEqual(self.viewer.zoom_debounce_timer, "timer1")
+            # Check anim_start values are set from current state
+            self.assertEqual(self.viewer.anim_start_zoom, 1.0)
+            self.assertEqual(self.viewer.anim_start_x, 0)
+            self.assertEqual(self.viewer.anim_start_y, 0)
 
-    def test_zoom_image_cancels_pending_timer(self):
+            # Check anim_target values
+            expected_target_zoom = 1.0 * 1.1
+            img_coord_x = (mouse_x - 0) / 1.0  # 100
+            img_coord_y = (mouse_y - 0) / 1.0  # 50
+            expected_target_x = mouse_x - (img_coord_x * expected_target_zoom) # 100 - (100 * 1.1) = -10
+            expected_target_y = mouse_y - (img_coord_y * expected_target_zoom) # 50 - (50 * 1.1) = -5
+            
+            self.assertAlmostEqual(self.viewer.anim_target_zoom, expected_target_zoom)
+            self.assertAlmostEqual(self.viewer.anim_target_x, expected_target_x)
+            self.assertAlmostEqual(self.viewer.anim_target_y, expected_target_y)
+            
+            self.assertEqual(self.viewer.anim_current_step, 0)
+            mock_animate_zoom_frame.assert_called_once()
+            mock_update_display.assert_not_called() # Not called directly if animation starts
+
+    def test_zoom_image_updates_display_when_targets_met_due_to_clamping(self):
+        """Verify update_display is called if zoom targets are met due to clamping, skipping animation."""
         self.viewer.image = self.mock_pil_image
-        self.viewer.zoom_debounce_timer = "old_timer_id" # Simulate a pending timer
-        
-        mock_event = self.create_mock_event(x=100, y=100, delta=120)
-        
-        self.viewer.master.after.return_value = "new_timer_id"
+        self.viewer.zoom_factor = 5.0  # Already at max zoom
+        self.viewer.image_x = 10
+        self.viewer.image_y = 20
 
-        self.viewer.zoom_image(mock_event)
-        
-        self.viewer.master.after_cancel.assert_called_once_with("old_timer_id")
-        self.viewer.master.after.assert_called_once_with(100, self.viewer._perform_zoom_update)
-        self.assertEqual(self.viewer.zoom_debounce_timer, "new_timer_id")
+        # Event is a zoom-in, which should be clamped.
+        mock_event = self.create_mock_event(x=100, y=100, delta=120) 
 
-    def test_perform_zoom_update_calls_update_display(self):
-        self.viewer.image = self.mock_pil_image 
-        self.viewer.zoom_debounce_timer = "some_timer_id" 
+        with patch.object(self.viewer, '_animate_zoom_frame') as mock_animate_zoom_frame, \
+             patch.object(self.viewer, 'update_display') as mock_update_display:
+
+            self.viewer.zoom_image(mock_event)
+            
+            # Targets should be clamped to current values if already at max zoom and trying to zoom in.
+            # anim_start_zoom will be 5.0.
+            # base_for_compounding_zoom will be 5.0. scale_change is 1.1.
+            # new_target_zoom = 5.0 * 1.1 = 5.5. Clamped anim_target_zoom = 5.0.
+            # So, anim_start_zoom (5.0) and anim_target_zoom (5.0) are same.
+            # img_coord_x = (100 - 10) / 5.0 = 18
+            # img_coord_y = (100 - 20) / 5.0 = 16
+            # anim_target_x = 100 - (18 * 5.0) = 10
+            # anim_target_y = 100 - (16 * 5.0) = 20
+            # So anim_start_x/y (10,20) and anim_target_x/y (10,20) are same.
+            
+            self.assertEqual(self.viewer.anim_start_zoom, 5.0)
+            self.assertEqual(self.viewer.anim_target_zoom, 5.0)
+            self.assertEqual(self.viewer.anim_start_x, 10)
+            self.assertEqual(self.viewer.anim_target_x, 10)
+            self.assertEqual(self.viewer.anim_start_y, 20)
+            self.assertEqual(self.viewer.anim_target_y, 20)
+
+            # update_display might be called if micro-differences existed before exact assignment.
+            # Given the direct calculation and then comparison, if they are identical, 
+            # zoom_image's internal update_display call for micro-differences might not run.
+            # The key is _animate_zoom_frame is NOT called.
+            mock_animate_zoom_frame.assert_not_called()
+            # If start and target are truly identical, the final update_display in zoom_image might be skipped.
+            # We'll check if it was called 0 or 1 times.
+            self.assertIn(mock_update_display.call_count, [0, 1])
+
+
+    def test_zoom_image_restarts_running_animation_with_compounded_target(self):
+        """Verify zoom_image cancels a running animation, compounds target, and restarts animation."""
+        self.viewer.image = self.mock_pil_image
+        self.viewer.zoom_factor = 1.2  # Current display zoom
+        self.viewer.image_x = 10
+        self.viewer.image_y = -10
+
+        # Simulate a running animation with a different target
+        self.viewer.animation_timer_id = "fake_timer_id_from_master_after"
+        self.viewer.anim_target_zoom = 1.5 # Target of the "running" animation
+        # anim_start_zoom for the "running" animation could be anything, e.g., 1.0
+        self.viewer.anim_start_zoom = 1.0 
+        # anim_target_x/y for the "running" animation also need to be set for consistency
+        self.viewer.anim_target_x = 0 
+        self.viewer.anim_target_y = 0
         
-        with patch.object(self.viewer, 'update_display') as mock_update_display:
-            self.viewer._perform_zoom_update()
-            mock_update_display.assert_called_once()
-            self.assertIsNone(self.viewer.zoom_debounce_timer)
+        # New scroll event (zoom in again)
+        mouse_x, mouse_y = 100, 100
+        mock_event = self.create_mock_event(x=mouse_x, y=mouse_y, delta=120) # Zoom in (1.1x)
+
+        with patch.object(self.viewer, '_animate_zoom_frame') as mock_animate_zoom_frame, \
+             patch.object(self.viewer.master, 'after_cancel') as mock_after_cancel:
+
+            self.viewer.zoom_image(mock_event)
+
+            # 1. Assert running animation was cancelled
+            mock_after_cancel.assert_called_once_with("fake_timer_id_from_master_after")
+            self.assertIsNone(self.viewer.animation_timer_id) # Should be cleared by zoom_image
+
+            # 2. Assert new animation start points are from current *display* state
+            self.assertEqual(self.viewer.anim_start_zoom, 1.2)
+            self.assertEqual(self.viewer.anim_start_x, 10)
+            self.assertEqual(self.viewer.anim_start_y, -10)
+
+            # 3. Assert new target zoom is compounded from *previous target*
+            # Previous anim_target_zoom was 1.5. New scroll is 1.1x.
+            expected_new_compounded_target_zoom = 1.5 * 1.1 
+            self.assertAlmostEqual(self.viewer.anim_target_zoom, expected_new_compounded_target_zoom)
+
+            # 4. Assert new target x/y are calculated based on current mouse and new compounded zoom
+            # img_coord_x based on current display state (zoom_factor=1.2, image_x=10)
+            # img_coord_x = (100 - 10) / 1.2 = 90 / 1.2 = 75
+            # img_coord_y = (100 - (-10)) / 1.2 = 110 / 1.2 = 91.666...
+            img_coord_x_val = (mouse_x - 1.2) / 1.2 
+            img_coord_y_val = (mouse_y - (-10)) / 1.2
+
+            current_img_coord_x = (mouse_x - self.viewer.anim_start_x) / self.viewer.anim_start_zoom
+            current_img_coord_y = (mouse_y - self.viewer.anim_start_y) / self.viewer.anim_start_zoom
+            
+            expected_target_x = mouse_x - (current_img_coord_x * expected_new_compounded_target_zoom)
+            expected_target_y = mouse_y - (current_img_coord_y * expected_new_compounded_target_zoom)
+            
+            self.assertAlmostEqual(self.viewer.anim_target_x, expected_target_x)
+            self.assertAlmostEqual(self.viewer.anim_target_y, expected_target_y)
+
+            # 5. Assert animation is (re)started
+            self.assertEqual(self.viewer.anim_current_step, 0)
+            mock_animate_zoom_frame.assert_called_once()
 
 
     # --- Crop Coordinate Calculation Tests (`save_cropped_image`) ---

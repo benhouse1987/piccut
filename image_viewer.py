@@ -16,7 +16,7 @@ PROXY_CREATION_THRESHOLD_DIM = 6000  # If max(width, height) > this, create prox
 PROXY_MAX_TARGET_DIM = 3000        # Proxy's max dimension (target for proxy)
 ROTATION_INCREMENT = 5.0           # Degrees for each rotation step
 # Animation Constants
-ANIMATION_DURATION_MS = 200  # Total duration of zoom animation
+ANIMATION_DURATION_MS = 100  # Total duration of zoom animation
 ANIMATION_TOTAL_STEPS = 10   # Number of frames in the animation
 
 
@@ -395,89 +395,73 @@ class ImageViewer:
 
 
     def zoom_image(self, event):
-        """
-        Handle mouse wheel scrolling to zoom the image.
-
-        Zooms in or out based on the scroll direction. The zoom is centered
-        around the mouse cursor's position on the image.
-
-        Args:
-            event: The Tkinter event object (e.g., from <MouseWheel> binding).
-                   Contains `event.delta` (Windows) or `event.num` (Linux/macOS)
-                   for scroll direction, and `event.x`, `event.y` for cursor position.
-        """
         if self.image is None:
-            return 
+            return
         
         self.is_zoomed_to_original_size = False # Any scroll zoom overrides double-click state
 
-        # Cancel any ongoing animation frame timer from previous zoom events
-        if self.animation_timer_id:
-            self.master.after_cancel(self.animation_timer_id)
-            self.animation_timer_id = None
-            # When animation is cancelled, current self.zoom_factor, self.image_x, self.image_y
-            # will reflect the last rendered frame of that animation. These become the start
-            # for the new animation calculation initiated by the new scroll.
-
-        # Store current state as potential start for animation if debounce doesn't cancel this
-        current_zoom_factor = self.zoom_factor
-        current_image_x = self.image_x
-        current_image_y = self.image_y
-
-        zoom_step = 0.1 
+        # Point on the *working* image under the mouse, based on *current display* state
+        img_coord_x = (event.x - self.image_x) / self.zoom_factor
+        img_coord_y = (event.y - self.image_y) / self.zoom_factor
         
-        # Calculate target zoom factor based on scroll direction
-        target_zoom_factor = current_zoom_factor # Start with current
-        if event.num == 4 or event.delta > 0:
-            target_zoom_factor *= (1 + zoom_step)
-        elif event.num == 5 or event.delta < 0:
-            target_zoom_factor *= (1 - zoom_step)
-        else:
+        # Determine zoom step factor from event
+        zoom_step_val = 0.1 
+        if event.num == 4 or event.delta > 0: # Zoom in
+            scale_change = (1 + zoom_step_val)
+        elif event.num == 5 or event.delta < 0: # Zoom out
+            scale_change = (1 - zoom_step_val)
+        else: # Should not happen with current bindings
             return
-        
-        target_zoom_factor = max(0.1, min(target_zoom_factor, 5.0))
 
-        # Calculate target image position (zoom towards cursor)
-        mouse_x = event.x
-        mouse_y = event.y
-        
-        # Point on the *working* image under the mouse before this proposed zoom
-        # Use `current_zoom_factor` because that's what's currently displayed
-        img_coord_x = (mouse_x - current_image_x) / current_zoom_factor
-        img_coord_y = (mouse_y - current_image_y) / current_zoom_factor
-        
-        # Calculate new top-left to keep this point under the cursor with `target_zoom_factor`
-        self.anim_target_zoom = target_zoom_factor
-        self.anim_target_x = mouse_x - (img_coord_x * self.anim_target_zoom)
-        self.anim_target_y = mouse_y - (img_coord_y * self.anim_target_zoom)
+        # Determine the base zoom for this event's calculation.
+        # If an animation is already running (animation_timer_id is set),
+        # we want to compound based on its *intended target* (anim_target_zoom).
+        # Otherwise, we compound based on the currently displayed zoom_factor.
+        base_for_compounding_zoom = self.zoom_factor
+        if self.animation_timer_id is not None: # Check if an animation frame is scheduled
+            base_for_compounding_zoom = self.anim_target_zoom 
 
-        # Debounce the start of the animation
-        if self.zoom_debounce_timer:
-            self.master.after_cancel(self.zoom_debounce_timer)
-        
-        self.zoom_debounce_timer = self.master.after(100, self._perform_zoom_update)
+        # Calculate new target zoom
+        new_target_zoom = base_for_compounding_zoom * scale_change
+        self.anim_target_zoom = max(0.1, min(new_target_zoom, 5.0)) # Clamp target zoom
 
-    def _perform_zoom_update(self):
-        """
-        Called by the zoom debounce timer. Initiates the zoom animation.
-        """
-        if not self.image:
-            return
-        self.zoom_debounce_timer = None 
+        # Calculate target image position to keep the img_coord_x/y (image point)
+        # under the current mouse cursor position (event.x, event.y) with the new target zoom.
+        self.anim_target_x = event.x - (img_coord_x * self.anim_target_zoom)
+        self.anim_target_y = event.y - (img_coord_y * self.anim_target_zoom)
 
-        # If there's an old animation running, ensure it's stopped.
-        if self.animation_timer_id:
-            self.master.after_cancel(self.animation_timer_id)
-            self.animation_timer_id = None
-
-        # Setup for the new animation sequence
-        self.anim_start_zoom = self.zoom_factor 
+        # Animation starting point is always the current displayed state
+        self.anim_start_zoom = self.zoom_factor
         self.anim_start_x = self.image_x
         self.anim_start_y = self.image_y
-        # Targets (self.anim_target_zoom, _x, _y) are already set by the last call to zoom_image
         
-        self.anim_current_step = 0
-        self._animate_zoom_frame() 
+        # If an animation frame was already scheduled, cancel it. A new one will be started/evaluated.
+        if self.animation_timer_id is not None:
+            self.master.after_cancel(self.animation_timer_id)
+            self.animation_timer_id = None # Crucial to clear it
+            
+        self.anim_current_step = 0 # Reset animation progress for the new/restarted animation
+
+        # Tolerance check: if already at (or very close to) the target.
+        tolerance = 0.0001 
+        if abs(self.anim_start_zoom - self.anim_target_zoom) < tolerance and \
+           abs(self.anim_start_x - self.anim_target_x) < tolerance and \
+           abs(self.anim_start_y - self.anim_target_y) < tolerance:
+            
+            # If state is already effectively the target, ensure it's exactly the target
+            # and update display once if there was any micro-difference.
+            if self.zoom_factor != self.anim_target_zoom or \
+               self.image_x != self.anim_target_x or \
+               self.image_y != self.anim_target_y:
+                
+                self.zoom_factor = self.anim_target_zoom
+                self.image_x = self.anim_target_x
+                self.image_y = self.anim_target_y
+                self.update_display()
+            return # Do not start new animation cycle
+
+        # Start/Restart the animation using _animate_zoom_frame
+        self._animate_zoom_frame()
 
     def _animate_zoom_frame(self):
         """
