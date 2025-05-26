@@ -17,7 +17,7 @@ PROXY_MAX_TARGET_DIM = 3000        # Proxy's max dimension (target for proxy)
 ROTATION_INCREMENT = 5.0           # Degrees for each rotation step
 # Animation Constants
 ANIMATION_DURATION_MS = 200  # Total duration of zoom animation
-ANIMATION_TOTAL_STEPS = 10   # Number of frames in the animation
+ANIMATION_TOTAL_STEPS = 5   # Number of frames in the animation
 
 
 class ImageViewer:
@@ -82,6 +82,7 @@ class ImageViewer:
         self.anim_target_x = 0.0
         self.anim_target_y = 0.0
         self.anim_current_step = 0
+        self.is_animating_zoom = False
 
         # --- Panning State ---
         self.drag_start_x = 0  # Mouse x-coordinate at the start of a pan.
@@ -373,9 +374,13 @@ class ImageViewer:
 
         try:
             # Resize for Display
+            resampling_filter = Image.Resampling.LANCZOS # Default high quality
+            if hasattr(self, 'is_animating_zoom') and self.is_animating_zoom:
+                resampling_filter = Image.Resampling.NEAREST # Fastest for animation frames
+            
             image_to_render = image_to_be_zoomed.resize(
                 (scaled_width, scaled_height), 
-                Image.Resampling.NEAREST # Consistent with zoom quality
+                resampling_filter
             )
             
             self.tk_image = ImageTk.PhotoImage(image_to_render)
@@ -456,6 +461,7 @@ class ImageViewer:
         if self.animation_timer_id:
             self.master.after_cancel(self.animation_timer_id)
             self.animation_timer_id = None # Clear the ID
+            self.is_animating_zoom = False
 
         # Setup for the new animation sequence, starting from the current animated state
         self.anim_start_zoom = self.zoom_factor 
@@ -473,6 +479,7 @@ class ImageViewer:
         """
         Performs a single frame of the zoom animation.
         """
+        self.is_animating_zoom = True
         self.anim_current_step += 1
         progress = self.anim_current_step / ANIMATION_TOTAL_STEPS
 
@@ -480,6 +487,7 @@ class ImageViewer:
             self.zoom_factor = self.anim_target_zoom
             self.image_x = self.anim_target_x
             self.image_y = self.anim_target_y
+            self.is_animating_zoom = False # Animation finished
             self.animation_timer_id = None
             # if self.zoom_factor == 1.0: # Check if it's 100% zoom # Commenting out original comments
                  # pass 
