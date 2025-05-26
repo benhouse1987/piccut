@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch, MagicMock
 import os # For os.path.join, os.path.splitext if used directly
 from datetime import datetime
+from PIL import Image # Added import
 
 # Attempt to import ImageViewer, may need to adjust sys.path if running test directly
 # and image_viewer.py is not in the same directory or Python path.
@@ -955,6 +956,51 @@ class TestImageViewerLogic(unittest.TestCase):
         # self.viewer.master is a MagicMock, so self.viewer.master.destroy is also a mock
         self.viewer.handle_escape_key() # Call the handler directly
         self.viewer.master.destroy.assert_called_once()
+
+    def test_update_display_uses_bicubic_resampling_no_rotation(self):
+        # Setup: Ensure an image is assigned and it has a size.
+        # self.viewer.image is already a MagicMock(spec=Image.Image) from setUp.
+        # We need to ensure it's configured for this test.
+        current_image_mock = MagicMock(spec=Image.Image)
+        current_image_mock.width = 100
+        current_image_mock.height = 100
+        current_image_mock.size = (100, 100)
+        
+        # Assign this specifically configured mock to self.viewer.image for this test
+        self.viewer.image = current_image_mock
+        
+        # Set rotation angle to 0 to simplify the path through update_display,
+        # ensuring self.viewer.image is the one that .resize is called on (it becomes image_to_be_zoomed).
+        self.viewer.current_rotation_angle = 0.0
+        
+        # Get the .resize mock from our specific image instance for this test
+        mock_resize_method_on_instance = self.viewer.image.resize 
+        
+        # Mock the return value of the resize operation.
+        # This is what PhotoImage will be called with.
+        mock_resized_result_image = MagicMock(spec=Image.Image) 
+        mock_resize_method_on_instance.return_value = mock_resized_result_image
+
+        # Call the method under test
+        self.viewer.update_display()
+
+        # Assert that resize was called
+        mock_resize_method_on_instance.assert_called()
+        
+        # Get the arguments from the call to resize
+        # call_args gives a tuple (positional_args, keyword_args)
+        # positional_args is also a tuple.
+        called_args_tuple = mock_resize_method_on_instance.call_args[0]
+        
+        # For an instance method call like `instance.resize(size_tuple, resample_filter)`,
+        # called_args_tuple will be `(size_tuple, resample_filter)`.
+        # So, called_args_tuple[1] is the resampling filter.
+        actual_resampling_filter = called_args_tuple[1]
+        self.assertEqual(actual_resampling_filter, Image.Resampling.BICUBIC)
+
+        # Also check that PhotoImage was called with the result of the resize
+        # self.mock_photo_image_constructor is from setUp: patch('image_viewer.ImageTk.PhotoImage', MagicMock())
+        self.mock_photo_image_constructor.assert_called_with(mock_resized_result_image)
 
 
 if __name__ == '__main__':

@@ -375,7 +375,7 @@ class ImageViewer:
             # Resize for Display
             image_to_render = image_to_be_zoomed.resize(
                 (scaled_width, scaled_height), 
-                Image.Resampling.NEAREST # Consistent with zoom quality
+                Image.Resampling.BICUBIC # Consistent with zoom quality
             )
             
             self.tk_image = ImageTk.PhotoImage(image_to_render)
