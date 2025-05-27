@@ -11,6 +11,15 @@ except ImportError:
     # Inform the user if Pillow is not installed, as image features will be disabled.
     print("Pillow library not found. Image opening functionality will be disabled.")
 
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    print("OpenCV library not found. GPU acceleration check will be skipped.")
+
+
 # Constants for proxy image handling
 PROXY_CREATION_THRESHOLD_DIM = 6000  # If max(width, height) > this, create proxy
 PROXY_MAX_TARGET_DIM = 3000        # Proxy's max dimension (target for proxy)
@@ -130,6 +139,22 @@ class ImageViewer:
         # Bind Escape key to exit application
         master.bind('<Escape>', self.handle_escape_key)
 
+        # --- GPU Availability Check ---
+        self.gpu_available = False
+        if OPENCV_AVAILABLE:
+            try:
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    self.gpu_available = True
+                    print("GPU acceleration is available.") # Or use logging
+                else:
+                    print("GPU acceleration not available (no CUDA devices found).")
+            except AttributeError:
+                # This can happen if cv2.cuda is not available (OpenCV not compiled with CUDA)
+                print("GPU acceleration not available (OpenCV not compiled with CUDA support).")
+            except Exception as e:
+                # Catch any other errors during CUDA check
+                print(f"Error checking for GPU availability: {e}")
+
     def _fit_image_to_canvas(self, target_canvas_width=None, target_canvas_height=None):
         """
         Calculates zoom_factor, image_x, and image_y to fit the current image
@@ -245,9 +270,68 @@ class ImageViewer:
 
                 try:
                     print(f"Creating proxy: original ({self.original_width}x{self.original_height}), proxy ({proxy_width}x{proxy_height})")
-                    self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
-                except Exception as e:
-                    print(f"Error creating proxy: {e}")
+                    if self.gpu_available and OPENCV_AVAILABLE:
+                        try:
+                            # GPU Path for Proxy Creation
+                            pil_mode = self.original_image.mode
+                            cv_source_image = None
+                            target_pil_mode = pil_mode # Default to original mode after conversion
+
+                            if pil_mode == 'RGBA':
+                                cv_source_image = cv2.cvtColor(np.array(self.original_image), cv2.COLOR_RGBA2BGRA)
+                            elif pil_mode == 'RGB':
+                                cv_source_image = cv2.cvtColor(np.array(self.original_image), cv2.COLOR_RGB2BGR)
+                            elif pil_mode == 'L':
+                                cv_source_image = np.array(self.original_image)
+                            elif pil_mode == 'P':
+                                if 'transparency' in self.original_image.info:
+                                    converted_pil_image = self.original_image.convert('RGBA')
+                                    cv_source_image = cv2.cvtColor(np.array(converted_pil_image), cv2.COLOR_RGBA2BGRA)
+                                    target_pil_mode = 'RGBA'
+                                else:
+                                    converted_pil_image = self.original_image.convert('RGB')
+                                    cv_source_image = cv2.cvtColor(np.array(converted_pil_image), cv2.COLOR_RGB2BGR)
+                                    target_pil_mode = 'RGB'
+                            # Add other conversions if necessary e.g. LA -> RGBA
+                            # elif pil_mode == 'LA':
+                            #     converted_pil_image = self.original_image.convert('RGBA')
+                            #     cv_source_image = cv2.cvtColor(np.array(converted_pil_image), cv2.COLOR_RGBA2BGRA)
+                            #     target_pil_mode = 'RGBA'
+
+
+                            if cv_source_image is not None:
+                                gpu_original_image = cv2.cuda_GpuMat()
+                                gpu_original_image.upload(cv_source_image)
+
+                                gpu_resized_proxy = cv2.cuda.resize(gpu_original_image, (proxy_width, proxy_height), interpolation=cv2.INTER_CUBIC)
+                                resized_cv_proxy = gpu_resized_proxy.download()
+
+                                if target_pil_mode == 'RGBA':
+                                    final_cv_proxy = cv2.cvtColor(resized_cv_proxy, cv2.COLOR_BGRA2RGBA)
+                                    self.image = Image.fromarray(final_cv_proxy, 'RGBA')
+                                elif target_pil_mode == 'RGB':
+                                    final_cv_proxy = cv2.cvtColor(resized_cv_proxy, cv2.COLOR_BGR2RGB)
+                                    self.image = Image.fromarray(final_cv_proxy, 'RGB')
+                                elif target_pil_mode == 'L':
+                                    self.image = Image.fromarray(resized_cv_proxy, 'L')
+                                else: # Should not happen if logic is correct
+                                    print(f"GPU proxy: Unexpected target_pil_mode '{target_pil_mode}'. Using CPU fallback.")
+                                    self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
+                                print("Proxy created using GPU.")
+                            else:
+                                # cv_source_image is None, means mode was not convertible for GPU
+                                print(f"GPU proxy: Unsupported PIL mode '{pil_mode}' for direct conversion. Using CPU fallback.")
+                                self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
+
+                        except Exception as e_gpu_proxy:
+                            print(f"GPU proxy creation failed: {e_gpu_proxy}. Falling back to CPU for proxy.")
+                            self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
+                    else:
+                        # GPU not available or OpenCV not available, use CPU
+                        print("GPU not available or OpenCV not found. Using CPU for proxy creation.")
+                        self.image = self.original_image.resize((proxy_width, proxy_height), Image.Resampling.BICUBIC)
+                except Exception as e: # Outer try-except for overall proxy creation process
+                    print(f"Error creating proxy (after GPU/CPU selection): {e}")
                     self.image = self.original_image # Fallback to original
             else:
                 print(f"Using original image: ({self.original_width}x{self.original_height})")
@@ -373,10 +457,90 @@ class ImageViewer:
 
         try:
             # Resize for Display
-            image_to_render = image_to_be_zoomed.resize(
-                (scaled_width, scaled_height), 
-                Image.Resampling.NEAREST # Consistent with zoom quality
-            )
+            if self.gpu_available and OPENCV_AVAILABLE:
+                gpu_processed_successfully = False
+                try:
+                    # Ensure target dimensions are valid for OpenCV
+                    cv_scaled_width = max(1, scaled_width)
+                    cv_scaled_height = max(1, scaled_height)
+                    pil_mode = image_to_be_zoomed.mode
+                    source_cv_image_for_gpu = None
+                    
+                    if pil_mode == 'RGBA':
+                        cv_image = np.array(image_to_be_zoomed)
+                        cv_image_bgra = cv2.cvtColor(cv_image, cv2.COLOR_RGBA2BGRA)
+                        source_cv_image_for_gpu = cv_image_bgra
+                    elif pil_mode == 'RGB':
+                        cv_image = np.array(image_to_be_zoomed)
+                        cv_image_bgr = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
+                        source_cv_image_for_gpu = cv_image_bgr
+                    elif pil_mode == 'L': # Grayscale
+                        source_cv_image_for_gpu = np.array(image_to_be_zoomed)
+                    elif pil_mode == 'P': # Palette mode
+                        if 'transparency' in image_to_be_zoomed.info:
+                            # Convert P with transparency to RGBA for GPU
+                            image_rgba_pil = image_to_be_zoomed.convert('RGBA')
+                            cv_image = np.array(image_rgba_pil)
+                            cv_image_bgra = cv2.cvtColor(cv_image, cv2.COLOR_RGBA2BGRA)
+                            source_cv_image_for_gpu = cv_image_bgra
+                            pil_mode = 'RGBA' # Update pil_mode as the source is now effectively RGBA
+                        else:
+                            # Convert P without transparency to RGB for GPU
+                            image_rgb_pil = image_to_be_zoomed.convert('RGB')
+                            cv_image = np.array(image_rgb_pil)
+                            cv_image_bgr = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
+                            source_cv_image_for_gpu = cv_image_bgr
+                            pil_mode = 'RGB' # Update pil_mode as the source is now effectively RGB
+                    # Add other mode conversions here if necessary, e.g., LA to RGBA
+                    # elif pil_mode == 'LA':
+                    #     image_rgba_pil = image_to_be_zoomed.convert('RGBA')
+                    #     cv_image = np.array(image_rgba_pil)
+                    #     cv_image_bgra = cv2.cvtColor(cv_image, cv2.COLOR_RGBA2BGRA)
+                    #     source_cv_image_for_gpu = cv_image_bgra
+                    #     pil_mode = 'RGBA'
+
+                    if source_cv_image_for_gpu is not None:
+                        gpu_image = cv2.cuda_GpuMat()
+                        gpu_image.upload(source_cv_image_for_gpu)
+
+                        gpu_resized = cv2.cuda.resize(gpu_image, (cv_scaled_width, cv_scaled_height), interpolation=cv2.INTER_NEAREST)
+                        resized_cv_image = gpu_resized.download()
+
+                        if pil_mode == 'RGBA': # Was originally RGBA or converted P with transparency
+                            resized_cv_image_rgba = cv2.cvtColor(resized_cv_image, cv2.COLOR_BGRA2RGBA)
+                            image_to_render = Image.fromarray(resized_cv_image_rgba, 'RGBA')
+                        elif pil_mode == 'RGB': # Was originally RGB or converted P without transparency
+                            resized_cv_image_rgb = cv2.cvtColor(resized_cv_image, cv2.COLOR_BGR2RGB)
+                            image_to_render = Image.fromarray(resized_cv_image_rgb, 'RGB')
+                        elif pil_mode == 'L':
+                            image_to_render = Image.fromarray(resized_cv_image, 'L')
+                        # Other converted modes like LA would be handled by their target (e.g., RGBA)
+                        gpu_processed_successfully = True
+                    else:
+                        # This 'else' means pil_mode was not one of RGBA, RGB, L, or P (or other handled conversions)
+                        print(f"GPU resize: Unsupported PIL mode '{image_to_be_zoomed.mode}' for direct GPU conversion. Falling back to CPU for this frame.")
+                        # image_to_render will be set by CPU path below
+                        pass # Let it fall through to the CPU resize outside this try-except if gpu_processed_successfully is False
+
+                except cv2.error as e: # Specifically catch OpenCV errors, often from CUDA
+                    print(f"OpenCV GPU resize failed: {e}. Falling back to CPU and disabling GPU for future.")
+                    self.gpu_available = False # Disable future GPU attempts as it's likely a persistent issue
+                    # Fallback handled by checking gpu_processed_successfully below
+                except Exception as e:
+                    print(f"Generic GPU resize failed: {e}. Falling back to CPU for this frame.")
+                    # Not disabling self.gpu_available for generic errors, might be transient
+                    # Fallback handled by checking gpu_processed_successfully below
+
+                if not gpu_processed_successfully: # If GPU path failed or was skipped for unsupported mode
+                    image_to_render = image_to_be_zoomed.resize(
+                        (scaled_width, scaled_height),
+                        Image.Resampling.NEAREST
+                    )
+            else: # GPU not available or OpenCV not available, use CPU
+                image_to_render = image_to_be_zoomed.resize(
+                    (scaled_width, scaled_height),
+                    Image.Resampling.NEAREST
+                )
             
             self.tk_image = ImageTk.PhotoImage(image_to_render)
 
